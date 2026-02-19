@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """
-Streamlit v3.1 Options Flow Scanner (UW + Polygon + EODHD) — Improved
-====================================================================
-Improvements included (no patching needed):
-- Excludes SPY/QQQ/IWM and sector ETFs when "Exclude index tickers" is checked
-- Execution-side rule: if Ask% is unknown (0 / missing), it's neutral (no penalty)
-- Extra filters: Min size (contracts) + Min Vol/OI
-- Skip breakdown (why trades were skipped)
-- Ladder detection improved: requires same ticker/type/expiry + multiple strikes within a recent time window
-- UI polish + safer defaults
+Streamlit v3.1 Options Flow Scanner (Improved + Replay Mode)
+============================================================
+Features:
+- Live mode: pulls UW flow alerts
+- Replay mode: re-scores saved snapshot (works when market closed)
+- Snapshot file: last_uw_flows.json (auto-saved on Live scan)
+- Upload snapshot JSON + Download snapshot
+- Better exclusions: indices + SPY/QQQ/IWM + sector ETFs
+- Execution-side rule: Ask% unknown (0) => neutral (no penalty)
+- Extra filters: min size + min Vol/OI
+- Skip breakdown
+- Improved ladder detection (time window)
+- Verdict labels improved: 5 => WATCHLIST (since scanner queues >=5)
 
 Deploy:
 - app.py in repo root
-- requirements.txt includes: streamlit, requests
+- requirements.txt: streamlit, requests
 
 Secrets (Streamlit Cloud):
 UW_TOKEN, POLYGON_API_KEY, EODHD_API_KEY
@@ -28,22 +32,24 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 import streamlit as st
 
+
 # -------------------- Constants --------------------
 
-CT_OFFSET = -6  # Central Time offset (package default)
+CT_OFFSET = -6  # Central Time offset
 MAX_PENDING_TRADES = 50
 
 PENDING_TRADES_FILE = "pending_trades.json"
 INVERSE_SIGNALS_FILE = "inverse_signals.json"
 VALIDATED_TRADES_FILE = "validated_trades.json"
 
-# Indexes + common index ETFs + sector ETFs
+SNAPSHOT_FILE = "last_uw_flows.json"
+
 EXCLUDED_TICKERS_DEFAULT = {
     # Indexes
     "SPX", "SPXW", "NDX", "VIX", "RUT", "DJX", "XSP", "OEX",
     # Index ETFs
     "SPY", "QQQ", "IWM", "DIA",
-    # Common sector/mega ETFs (optional but helpful for “no-index/ETF” mode)
+    # Sector ETFs (optional but helpful)
     "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLC",
 }
 
@@ -111,7 +117,6 @@ def parse_uw_time_to_utc(iso_timestamp: str) -> Optional[datetime]:
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             return dt.astimezone(timezone.utc)
-        # date-only fallback
         dt = datetime.strptime(iso_timestamp, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         return dt
     except Exception:
@@ -138,6 +143,66 @@ def ensure_json_file(path: str) -> None:
     if not os.path.exists(path):
         with open(path, "w", encoding="utf-8") as f:
             json.dump([], f, indent=2)
+
+
+def read_json_file(path: str, default: Any) -> Any:
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def write_json_file(path: str, data: Any) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, default=str)
+
+
+# -------------------- Snapshot Manager --------------------
+
+class SnapshotManager:
+    def __init__(self, path: str = SNAPSHOT_FILE):
+        self.path = path
+
+    def save(self, flows: List[Dict[str, Any]]) -> None:
+        payload = {
+            "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+            "count": len(flows),
+            "flows": flows,
+        }
+        write_json_file(self.path, payload)
+
+    def load(self) -> List[Dict[str, Any]]:
+        payload = read_json_file(self.path, {})
+        if isinstance(payload, dict) and isinstance(payload.get("flows"), list):
+            return payload["flows"]
+        # Backward-compat: if file is just a list
+        if isinstance(payload, list):
+            return payload
+        return []
+
+    def get_meta(self) -> Dict[str, Any]:
+        payload = read_json_file(self.path, {})
+        if isinstance(payload, dict):
+            return {
+                "saved_at_utc": payload.get("saved_at_utc"),
+                "count": payload.get("count"),
+            }
+        return {}
+
+    def exists(self) -> bool:
+        return os.path.exists(self.path)
+
+    def raw_text(self) -> str:
+        if not self.exists():
+            return ""
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception:
+            return ""
 
 
 # -------------------- API Clients --------------------
@@ -172,7 +237,7 @@ class UnusualWhalesAPI:
             return []
         return data.get("data", []) or []
 
-    def get_ticker_flow(self, ticker: str, limit: int = 80) -> List[Dict[str, Any]]:
+    def get_ticker_flow(self, ticker: str, limit: int = 120) -> List[Dict[str, Any]]:
         ticker = ticker.strip().upper()
         status, data, _ = http_get(
             f"{self.BASE_URL}/stock/{ticker}/options-flow",
@@ -302,7 +367,6 @@ class PolygonAPI:
         recent_high_wick = max(highs[-5:]) if len(highs) >= 5 else max(highs)
         recent_low_wick = min(lows[-5:]) if len(lows) >= 5 else min(lows)
 
-        # Basic wick trigger: strike near recent wick extremes
         wick_triggered = (abs(strike - recent_high_wick) < 0.5) or (abs(strike - recent_low_wick) < 0.5)
         return {
             "resistance": resistance,
@@ -315,13 +379,10 @@ class PolygonAPI:
 
 class EODHDAPI:
     """
-    EODHD API for IV and options chain snapshot.
-
-    Note:
-    - Marketplace historical IV endpoint often returns HTTP 422 (documented in package),
-      so IV ramp detection commonly falls back to chain snapshot (current IV only).
+    EODHD IV:
+    - Marketplace historical IV endpoint commonly returns HTTP 422 (documented).
+      We try it, then fall back to current chain IV.
     """
-
     BASE_URL = "https://eodhd.com/api"
 
     def __init__(self, api_key: str):
@@ -340,7 +401,6 @@ class EODHDAPI:
         ticker = ticker.strip().upper()
         option_type = option_type.lower().strip()
         try:
-            # Marketplace endpoint (often 422)
             url = f"{self.BASE_URL}/mp/unicornbay/options/eod"
             params = {
                 "api_token": self.api_key,
@@ -370,8 +430,6 @@ class EODHDAPI:
                             iv_history[trade_date] = iv_val
                 if iv_history:
                     return iv_history
-
-            # Fallback
             return self._get_iv_from_chain(ticker, strike, expiry, option_type)
         except Exception:
             return self._get_iv_from_chain(ticker, strike, expiry, option_type)
@@ -491,7 +549,6 @@ class DataEnricher:
                 except Exception:
                     continue
 
-        # Clean exception (as described)
         clean_exception = (
             ask_pct >= 70 and vol_oi_ratio > 1 and strike_dist_pct <= 7 and 2.5 <= premium_pct <= 5.0
         )
@@ -530,11 +587,9 @@ class DataEnricher:
 
 class LadderDetector:
     """
-    Improved ladder detection:
-    - Uses UW ticker options-flow list
+    Ladder detection:
     - Requires same expiry + type
-    - Requires >= 3 unique strikes including the target
-    - Requires these strikes to occur within a recent time window (minutes)
+    - Requires >= min_unique_strikes total strikes within recent_minutes (including target strike)
     """
 
     def __init__(self, uw: UnusualWhalesAPI):
@@ -549,15 +604,14 @@ class LadderDetector:
         recent_minutes: int = 90,
         min_unique_strikes: int = 3,
     ) -> Tuple[bool, List[float]]:
-        flows = self.uw.get_ticker_flow(ticker, limit=120)
+        flows = self.uw.get_ticker_flow(ticker, limit=180)
         if not flows:
             return False, []
 
         now_utc = datetime.now(timezone.utc)
         cutoff = now_utc - timedelta(minutes=recent_minutes)
 
-        strikes: set[float] = set()
-        strikes.add(float(target_strike))
+        strikes: set[float] = {float(target_strike)}
 
         for f in flows:
             f_type = str(f.get("option_type", "")).lower().strip()
@@ -566,9 +620,7 @@ class LadderDetector:
                 continue
 
             ts = parse_uw_time_to_utc(str(f.get("start_time", "")))
-            if ts is None:
-                continue
-            if ts < cutoff:
+            if ts is None or ts < cutoff:
                 continue
 
             f_strike = safe_float(f.get("strike", 0))
@@ -590,7 +642,7 @@ class V31ScoringEngine:
         penalties: List[str] = []
         record["category_tags"] = record.get("category_tags") or []
 
-        # RULE 4: Premium % of spot (heuristic)
+        # Premium % of spot (heuristic)
         prem_pct = safe_float(record.get("premium_pct", 0))
         if 2.5 <= prem_pct <= 5.0:
             score += 2
@@ -604,7 +656,7 @@ class V31ScoringEngine:
         else:
             factors.append(f"Excessive premium {prem_pct:.1f}% (0)")
 
-        # RULE 5: Strike distance
+        # Strike distance
         dist = safe_float(record.get("strike_dist_pct", 0))
         if dist <= 7:
             score += 2
@@ -615,7 +667,7 @@ class V31ScoringEngine:
             score -= 2
             penalties.append(f"Strike {dist:.1f}% deep OTM (-2)")
 
-        # RULE 6: DTE
+        # DTE
         dte = safe_int(record.get("dte", 0))
         if 7 <= dte <= 21:
             score += 1
@@ -624,9 +676,8 @@ class V31ScoringEngine:
             score -= 1
             penalties.append("0-1 DTE (-1)")
 
-        # RULE 7: Execution side
+        # Execution side
         ask_pct = safe_float(record.get("ask_pct", 0))
-        # IMPORTANT IMPROVEMENT: if ask_pct is 0 because data is missing, neutral (no penalty).
         if ask_pct >= 70:
             score += 1
             factors.append(f"Ask {ask_pct:.0f}% (+1)")
@@ -636,7 +687,7 @@ class V31ScoringEngine:
         else:
             factors.append("Execution side unknown/neutral (0)")
 
-        # RULE 8: Volume vs OI
+        # Volume vs OI
         vol_oi = safe_float(record.get("vol_oi_ratio", 0))
         if vol_oi >= 2:
             score += 2
@@ -645,18 +696,18 @@ class V31ScoringEngine:
             score += 1
             factors.append(f"Vol/OI {vol_oi:.1f}x (+1)")
 
-        # RULE 3: Wick rule
+        # Wick rule
         if bool(record.get("wick_triggered", False)):
             score -= 2
             penalties.append("Wick reversal strike (-2)")
 
-        # RULE 9: IV ramp
+        # IV ramp
         iv_ramping = bool(record.get("iv_ramping", False))
         if iv_ramping:
             score += 1
             factors.append("IV ramp detected (+1)")
 
-        # RULE 10: Ladder/cluster
+        # Ladder/cluster
         ladder_role = str(record.get("ladder_role", "isolated")).lower()
         if ladder_role in ("anchor", "specleg", "ladder"):
             score += 1
@@ -665,7 +716,7 @@ class V31ScoringEngine:
             score -= 1
             penalties.append("Isolated (-1)")
 
-        # RULE 11: Support penalty for puts
+        # Support penalty for puts
         if str(record.get("option_type", "")).lower() == "put":
             strike = safe_float(record.get("strike", 0))
             support = safe_float(record.get("support", 0))
@@ -689,7 +740,8 @@ class V31ScoringEngine:
 
         final_score = min(score, max_score)
 
-        # Verdict
+        # Verdict labels (improved UX)
+        # NOTE: keep scoring the same; just label 5 as WATCHLIST since queue threshold is >=5.
         if final_score >= 8:
             verdict = "HIGH CONVICTION"
             record["category_tags"].append("HighConviction")
@@ -699,6 +751,9 @@ class V31ScoringEngine:
         elif final_score >= 6:
             verdict = "MODERATE"
             record["category_tags"].append("Moderate")
+        elif final_score >= 5:
+            verdict = "WATCHLIST"
+            record["category_tags"].append("Watchlist")
         else:
             verdict = "TRAP / SKIP"
             record["category_tags"].append("Trap")
@@ -765,28 +820,69 @@ class QueueManager:
 # -------------------- Streamlit UI --------------------
 
 st.set_page_config(page_title="v3.1 Options Flow Scanner", layout="wide")
-st.title("v3.1 Options Flow Scanner (Improved)")
-st.caption("UW + Polygon + EODHD • v3.1 scoring • Pending/Inverse/Validated JSON queues")
+st.title("v3.1 Options Flow Scanner (Replay Mode)")
+st.caption("UW + Polygon + EODHD • v3.1 scoring • Live/Replay toggle • JSON queues")
+
+snapshot = SnapshotManager(SNAPSHOT_FILE)
 
 with st.sidebar:
+    st.header("Data Source")
+    data_mode = st.toggle("Replay Mode (ON = use saved snapshot)", value=False)
+    st.caption("Use Replay Mode when the market is closed.")
+    meta = snapshot.get_meta()
+    if meta.get("saved_at_utc"):
+        st.write(f"Snapshot saved: `{meta.get('saved_at_utc')}`")
+        st.write(f"Snapshot count: `{meta.get('count')}`")
+    else:
+        st.write("Snapshot saved: —")
+
+    st.divider()
     st.header("API Keys (Secrets recommended)")
     uw_token = st.text_input("Unusual Whales Token", value=os.getenv("UW_TOKEN", ""), type="password")
     polygon_key = st.text_input("Polygon API Key", value=os.getenv("POLYGON_API_KEY", ""), type="password")
     eodhd_key = st.text_input("EODHD API Key", value=os.getenv("EODHD_API_KEY", ""), type="password")
 
     st.divider()
+    st.subheader("Snapshot Tools")
+
+    # Upload snapshot JSON (optional)
+    uploaded = st.file_uploader("Upload snapshot JSON (optional)", type=["json"])
+    if uploaded is not None:
+        try:
+            up = json.loads(uploaded.read().decode("utf-8"))
+            if isinstance(up, dict) and isinstance(up.get("flows"), list):
+                snapshot.save(up["flows"])
+                st.success("Uploaded snapshot saved as last_uw_flows.json")
+            elif isinstance(up, list):
+                snapshot.save(up)
+                st.success("Uploaded list saved as last_uw_flows.json")
+            else:
+                st.error("Snapshot format not recognized.")
+        except Exception as e:
+            st.error(f"Upload error: {e}")
+
+    if snapshot.exists():
+        st.download_button(
+            "Download current snapshot",
+            data=snapshot.raw_text(),
+            file_name="last_uw_flows.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+    st.divider()
     st.subheader("Scan Controls")
 
-    mode = st.radio("Mode", ["Full Scan (with IV fetch)", "Quick Scan (skip IV)"], index=0)
-    fetch_iv = mode.startswith("Full")
+    mode = st.radio("IV Mode", ["Full (try IV)", "Quick (skip IV)"], index=0)
+    fetch_iv = (mode.startswith("Full"))
 
-    limit = st.slider("UW flow alerts limit", min_value=10, max_value=250, value=100, step=10)
+    limit = st.slider("UW flow alerts limit (Live only)", min_value=10, max_value=250, value=200, step=10)
 
-    min_premium = st.number_input("Min premium ($)", min_value=0, value=1_000_000, step=100_000)
+    min_premium = st.number_input("Min premium ($)", min_value=0, value=25_000, step=5_000)
     min_size = st.number_input("Min size (contracts)", min_value=0, value=0, step=100)
     min_vol_oi = st.number_input("Min Vol/OI", min_value=0.0, value=1.0, step=0.1)
 
-    require_vol_gt_oi = st.checkbox("Require Vol > OI", value=True)
+    require_vol_gt_oi = st.checkbox("Require Vol > OI", value=False)
     exclude_indices = st.checkbox("Exclude indices + major ETFs (SPX/SPY/QQQ/etc.)", value=True)
 
     st.divider()
@@ -818,6 +914,17 @@ queue = QueueManager(pending_path, inverse_path, validated_path)
 
 tabs = st.tabs(["Scan", "Manual Score", "Validate T+1", "Queues", "Connections"])
 
+
+def get_source_flows() -> Tuple[List[Dict[str, Any]], str]:
+    """Return (flows, source_label)."""
+    if data_mode:
+        flows = snapshot.load()
+        return flows, "Replay (snapshot)"
+    else:
+        flows = uw.get_flows(limit=limit)
+        return flows, "Live (UW API)"
+
+
 # -------------------- Scan --------------------
 with tabs[0]:
     st.subheader("Run Scanner")
@@ -825,23 +932,25 @@ with tabs[0]:
     colA, colB = st.columns([1, 2], gap="large")
     with colA:
         run = st.button("Run scan", type="primary", use_container_width=True)
-        st.caption("Tip: Lower Min premium if you want more results while testing.")
+        st.caption("Market closed? Turn ON Replay Mode so you can still test.")
     with colB:
         st.markdown(
             """
             **What this does**
-            - Pulls UW flow alerts (limit)
-            - Filters: min premium + optional vol>OI + excluded tickers + min size + min vol/oi
-            - Enriches: Polygon spot-at-time + S/R + wick, UW earnings, optional EODHD IV
-            - Detects ladder: multiple strikes within recent minutes
-            - Scores: v3.1 scoring engine
-            - Writes to queues: pending (score>=5), inverse (score<=-3)
+            - Gets UW flows (Live or Snapshot)
+            - Filters: min premium + exclusions + min size + min vol/oi (+ optional vol>OI)
+            - Enriches: Polygon spot + S/R + wick, UW earnings, optional EODHD IV
+            - Ladder detection within recent time window
+            - Scores v3.1 and writes queues:
+              - pending (score >= 5), inverse (score <= -3)
             """
         )
 
     if run:
-        if not (uw_token and polygon_key and eodhd_key):
-            st.error("Add your UW_TOKEN, POLYGON_API_KEY, and EODHD_API_KEY in Streamlit Secrets (or sidebar).")
+        # In replay mode, we don't need keys; but enrichment still needs Polygon/EODHD/UW earnings/ladder.
+        # We'll allow scoring with whatever keys are available, and degrade gracefully.
+        if not data_mode and not uw_token:
+            st.error("Live Mode requires UW_TOKEN (set in Secrets).")
         else:
             skip_reasons = {
                 "premium": 0,
@@ -852,26 +961,31 @@ with tabs[0]:
                 "bad_ticker": 0,
             }
 
-            with st.spinner("Fetching UW flows..."):
-                raw = uw.get_flows(limit=limit)
+            with st.spinner("Loading flows..."):
+                flows, src = get_source_flows()
 
-            if not raw:
-                st.warning("No UW flows returned. Check your UW token.")
+            if not flows:
+                st.warning(f"No flows available from {src}. If using Replay Mode, run Live once to create a snapshot.")
             else:
-                excluded = EXCLUDED_TICKERS_DEFAULT if exclude_indices else set()
+                # Auto-save snapshot whenever Live Mode pulls successfully
+                if not data_mode:
+                    try:
+                        snapshot.save(flows)
+                    except Exception:
+                        pass
 
+                excluded = EXCLUDED_TICKERS_DEFAULT if exclude_indices else set()
                 results: List[Dict[str, Any]] = []
                 skipped = 0
 
                 with st.spinner("Filtering, enriching, laddering, scoring..."):
-                    for f in raw:
+                    for f in flows:
                         ticker = str(f.get("ticker", "")).upper().strip()
                         if not ticker or len(ticker) > 8:
                             skipped += 1
                             skip_reasons["bad_ticker"] += 1
                             continue
 
-                        # Premium (sum of UW side premiums)
                         total_prem = (
                             safe_float(f.get("total_ask_side_prem", 0))
                             + safe_float(f.get("total_bid_side_prem", 0))
@@ -883,7 +997,6 @@ with tabs[0]:
                             skip_reasons["premium"] += 1
                             continue
 
-                        # Exclusions
                         if ticker in excluded:
                             skipped += 1
                             skip_reasons["excluded"] += 1
@@ -908,38 +1021,39 @@ with tabs[0]:
                             skip_reasons["min_vol_oi"] += 1
                             continue
 
-                        # Enrich
-                        enriched = enricher.enrich_trade(f, fetch_iv=fetch_iv)
+                        # Enrich (will use keys if present; Polygon/EODHD calls may fail if keys missing)
+                        enriched = enricher.enrich_trade(f, fetch_iv=bool(fetch_iv and eodhd_key))
 
-                        # Ladder detect (improved)
-                        is_ladder, related = ladder.detect(
-                            ticker=enriched["ticker"],
-                            target_strike=enriched["strike"],
-                            option_type=enriched["option_type"],
-                            expiry=enriched["expiry"],
-                            recent_minutes=int(ladder_minutes),
-                            min_unique_strikes=int(ladder_min_strikes),
-                        )
-                        if is_ladder:
-                            enriched["ladder_role"] = "ladder"
-                            enriched["related_strikes"] = related
+                        # Ladder only if UW token exists (needs ticker flow)
+                        if uw_token:
+                            is_ladder, related = ladder.detect(
+                                ticker=enriched["ticker"],
+                                target_strike=enriched["strike"],
+                                option_type=enriched["option_type"],
+                                expiry=enriched["expiry"],
+                                recent_minutes=int(ladder_minutes),
+                                min_unique_strikes=int(ladder_min_strikes),
+                            )
+                            if is_ladder:
+                                enriched["ladder_role"] = "ladder"
+                                enriched["related_strikes"] = related
 
-                        # Score
                         scored = scorer.score(enriched)
                         results.append(scored)
 
-                        # Queues
                         if safe_int(scored.get("predictive_score", 0)) >= 5:
                             queue.add_pending(scored)
                         if safe_int(scored.get("predictive_score", 0)) <= -3:
                             queue.add_inverse(scored)
 
-                st.success(f"Scored {len(results)} trades • Skipped {skipped}")
+                st.success(f"Source: {src} • Scored {len(results)} trades • Skipped {skipped}")
                 st.write("Skip breakdown:", skip_reasons)
 
                 if results:
-                    # Sort by score desc then premium desc
-                    results.sort(key=lambda r: (safe_int(r.get("predictive_score", 0)), safe_float(r.get("total_premium", 0))), reverse=True)
+                    results.sort(
+                        key=lambda r: (safe_int(r.get("predictive_score", 0)), safe_float(r.get("total_premium", 0))),
+                        reverse=True,
+                    )
 
                     table = []
                     for r in results:
@@ -1009,10 +1123,10 @@ with tabs[0]:
                             st.write("**Raw UW (debug)**")
                             st.json(r.get("_raw", {}))
 
+
 # -------------------- Manual Score --------------------
 with tabs[1]:
     st.subheader("Manual Score (paste one trade JSON)")
-    st.caption("If you paste a UW-like alert JSON, this will enrich + score it.")
 
     sample = {
         "ticker": "AAPL",
@@ -1042,25 +1156,22 @@ with tabs[1]:
                 raise ValueError("JSON must be an object")
 
             if do_enrich:
-                if not (uw_token and polygon_key and eodhd_key):
-                    st.error("Add your keys in Secrets (or sidebar) to enrich via APIs.")
-                else:
-                    enriched = enricher.enrich_trade(raw_flow, fetch_iv=do_iv)
-                    if do_ladder:
-                        is_l, rel = ladder.detect(
-                            ticker=enriched["ticker"],
-                            target_strike=enriched["strike"],
-                            option_type=enriched["option_type"],
-                            expiry=enriched["expiry"],
-                            recent_minutes=int(ladder_minutes),
-                            min_unique_strikes=int(ladder_min_strikes),
-                        )
-                        if is_l:
-                            enriched["ladder_role"] = "ladder"
-                            enriched["related_strikes"] = rel
-                    scored = scorer.score(enriched)
-                    st.success(f"Score: {scored['predictive_score']} / max {scored['max_score']} • {scored['verdict']}")
-                    st.json(scored)
+                enriched = enricher.enrich_trade(raw_flow, fetch_iv=bool(do_iv and eodhd_key))
+                if do_ladder and uw_token:
+                    is_l, rel = ladder.detect(
+                        ticker=enriched["ticker"],
+                        target_strike=enriched["strike"],
+                        option_type=enriched["option_type"],
+                        expiry=enriched["expiry"],
+                        recent_minutes=int(ladder_minutes),
+                        min_unique_strikes=int(ladder_min_strikes),
+                    )
+                    if is_l:
+                        enriched["ladder_role"] = "ladder"
+                        enriched["related_strikes"] = rel
+                scored = scorer.score(enriched)
+                st.success(f"Score: {scored['predictive_score']} / max {scored['max_score']} • {scored['verdict']}")
+                st.json(scored)
             else:
                 scored = scorer.score(raw_flow)
                 st.json(scored)
@@ -1068,10 +1179,10 @@ with tabs[1]:
         except Exception as e:
             st.error(f"Error: {e}")
 
+
 # -------------------- Validate T+1 --------------------
 with tabs[2]:
     st.subheader("Validate T+1 (manual inputs)")
-    st.caption("Select a pending trade and manually enter T+1 OI and IV to archive into validated queue.")
 
     pending = queue.load_queue(pending_path)
     if not pending:
@@ -1085,7 +1196,6 @@ with tabs[2]:
         idx = int(sel.split(":")[0])
         trade = pending[idx]
 
-        st.write("**Selected trade**")
         st.json(
             {k: trade.get(k) for k in [
                 "ticker", "option_type", "strike", "expiry", "entry_timestamp",
@@ -1150,39 +1260,33 @@ with tabs[2]:
                 t["validated_verdict"] = "TRADEABLE"
             elif vs >= 6:
                 t["validated_verdict"] = "MODERATE"
+            elif vs >= 5:
+                t["validated_verdict"] = "WATCHLIST"
             else:
                 t["validated_verdict"] = "TRAP / SKIP"
 
             queue.add_validated(t)
 
-            # remove from pending
             pending.pop(idx)
             queue.save_queue(pending_path, pending)
 
             st.success(f"Archived. Validated score: {t['validated_score']} • {t['validated_verdict']}")
             st.json(t)
 
+
 # -------------------- Queues --------------------
 with tabs[3]:
     st.subheader("Queues")
-
     c1, c2, c3 = st.columns(3)
+
     with c1:
         st.write("### Pending")
         pend = queue.load_queue(pending_path)
         st.write(f"{len(pend)} items")
         st.dataframe(
-            [
-                {
-                    "Ticker": t.get("ticker"),
-                    "Type": t.get("option_type"),
-                    "Strike": t.get("strike"),
-                    "Expiry": t.get("expiry"),
-                    "Score": t.get("predictive_score"),
-                    "Verdict": t.get("verdict"),
-                }
-                for t in pend[-200:]
-            ],
+            [{"Ticker": t.get("ticker"), "Type": t.get("option_type"), "Strike": t.get("strike"),
+              "Expiry": t.get("expiry"), "Score": t.get("predictive_score"), "Verdict": t.get("verdict")}
+             for t in pend[-200:]],
             use_container_width=True,
             hide_index=True,
         )
@@ -1192,17 +1296,9 @@ with tabs[3]:
         inv = queue.load_queue(inverse_path)
         st.write(f"{len(inv)} items")
         st.dataframe(
-            [
-                {
-                    "Ticker": t.get("ticker"),
-                    "Type": t.get("option_type"),
-                    "Strike": t.get("strike"),
-                    "Expiry": t.get("expiry"),
-                    "Score": t.get("predictive_score"),
-                    "Verdict": t.get("verdict"),
-                }
-                for t in inv[-200:]
-            ],
+            [{"Ticker": t.get("ticker"), "Type": t.get("option_type"), "Strike": t.get("strike"),
+              "Expiry": t.get("expiry"), "Score": t.get("predictive_score"), "Verdict": t.get("verdict")}
+             for t in inv[-200:]],
             use_container_width=True,
             hide_index=True,
         )
@@ -1212,18 +1308,10 @@ with tabs[3]:
         val = queue.load_queue(validated_path)
         st.write(f"{len(val)} items")
         st.dataframe(
-            [
-                {
-                    "Ticker": t.get("ticker"),
-                    "Type": t.get("option_type"),
-                    "Strike": t.get("strike"),
-                    "Expiry": t.get("expiry"),
-                    "Pred": t.get("predictive_score"),
-                    "Val": t.get("validated_score"),
-                    "Val Verdict": t.get("validated_verdict"),
-                }
-                for t in val[-200:]
-            ],
+            [{"Ticker": t.get("ticker"), "Type": t.get("option_type"), "Strike": t.get("strike"),
+              "Expiry": t.get("expiry"), "Pred": t.get("predictive_score"),
+              "Val": t.get("validated_score"), "Val Verdict": t.get("validated_verdict")}
+             for t in val[-200:]],
             use_container_width=True,
             hide_index=True,
         )
@@ -1235,19 +1323,22 @@ with tabs[3]:
         queue.save_queue(validated_path, [])
         st.warning("Queues cleared.")
 
+
 # -------------------- Connections --------------------
 with tabs[4]:
     st.subheader("Test Connections")
-
     col1, col2, col3 = st.columns(3)
+
     with col1:
         if st.button("Test UW"):
             ok, msg = uw.test_connection()
             st.success(msg) if ok else st.error(msg)
+
     with col2:
         if st.button("Test Polygon"):
             ok, msg = polygon.test_connection()
             st.success(msg) if ok else st.error(msg)
+
     with col3:
         if st.button("Test EODHD"):
             ok, msg = eodhd.test_connection()
@@ -1256,10 +1347,11 @@ with tabs[4]:
     st.divider()
     st.markdown(
         """
-**If you still see mostly TRAP/SKIP:**  
-- Lower **Min premium** while testing  
-- Check “Exclude indices + major ETFs” (SPY/QQQ/IWM will be excluded now)  
-- Execution side is now neutral when Ask% is unknown (0), so you should see fewer false traps
+**Why you might see lots of WATCHLIST/TRAP when market is closed**
+- UW alerts after-hours can be thinner, older, or have incomplete side fields  
+- IV ramp is usually unavailable (EODHD historical endpoint issue), so scores cap at 6/7  
+- That naturally clusters many signals around 4–6  
+
+If you want more “TRADEABLE/HIGH” results, run scans during market hours and use Replay Mode later.
 """
     )
-
