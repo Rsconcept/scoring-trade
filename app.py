@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """
-Streamlit v3.1 Options Flow Scanner (Improved + Replay Mode)
-============================================================
-Features:
-- Live mode: pulls UW flow alerts
-- Replay mode: re-scores saved snapshot (works when market closed)
-- Snapshot file: last_uw_flows.json (auto-saved on Live scan)
-- Upload snapshot JSON + Download snapshot
-- Better exclusions: indices + SPY/QQQ/IWM + sector ETFs
-- Execution-side rule: Ask% unknown (0) => neutral (no penalty)
-- Extra filters: min size + min Vol/OI
-- Skip breakdown
-- Improved ladder detection (time window)
-- Verdict labels improved: 5 => WATCHLIST (since scanner queues >=5)
+Streamlit v3.1 Options Flow Scanner (Replay Mode + Local IV History)
+====================================================================
+What’s new (requested):
+- Uses EODHD OPTIONS CHAIN snapshot IV (current IV per contract)
+- Stores IV DAILY in a local JSON file (iv_history_store.json)
+- Computes IV ramp from YOUR stored history (no more EODHD 422 dependency)
+- When IV ramp is detected from local history, max score cap unlocks (up to 12)
+
+Notes:
+- Streamlit Community Cloud has an ephemeral filesystem (files can reset on redeploy).
+  Replay snapshots + IV store are best-effort. If you want persistence, we can add
+  Google Drive / S3 / Supabase later.
 
 Deploy:
 - app.py in repo root
-- requirements.txt: streamlit, requests
+- requirements.txt:
+    streamlit
+    requests
 
-Secrets (Streamlit Cloud):
+Secrets:
 UW_TOKEN, POLYGON_API_KEY, EODHD_API_KEY
 """
 
@@ -26,12 +27,11 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import streamlit as st
-
 
 # -------------------- Constants --------------------
 
@@ -44,12 +44,15 @@ VALIDATED_TRADES_FILE = "validated_trades.json"
 
 SNAPSHOT_FILE = "last_uw_flows.json"
 
+# NEW: Local IV store file
+IV_STORE_FILE = "iv_history_store.json"
+
 EXCLUDED_TICKERS_DEFAULT = {
     # Indexes
     "SPX", "SPXW", "NDX", "VIX", "RUT", "DJX", "XSP", "OEX",
     # Index ETFs
     "SPY", "QQQ", "IWM", "DIA",
-    # Sector ETFs (optional but helpful)
+    # Sector ETFs
     "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLC",
 }
 
@@ -93,7 +96,6 @@ def http_get(
 
 
 def to_central_time(iso_timestamp: str, ct_offset_hours: int = CT_OFFSET) -> str:
-    """Convert ISO timestamp to 'YYYY-MM-DD HH:MM:SS AM CT'. If parsing fails, return raw."""
     if not iso_timestamp:
         return ""
     try:
@@ -108,7 +110,6 @@ def to_central_time(iso_timestamp: str, ct_offset_hours: int = CT_OFFSET) -> str
 
 
 def parse_uw_time_to_utc(iso_timestamp: str) -> Optional[datetime]:
-    """UW timestamps are usually ISO with Z. Return aware UTC dt."""
     if not iso_timestamp:
         return None
     try:
@@ -139,10 +140,10 @@ def pretty_money(x: float) -> str:
         return str(x)
 
 
-def ensure_json_file(path: str) -> None:
+def ensure_json_file(path: str, default_value: Any) -> None:
     if not os.path.exists(path):
         with open(path, "w", encoding="utf-8") as f:
-            json.dump([], f, indent=2)
+            json.dump(default_value, f, indent=2)
 
 
 def read_json_file(path: str, default: Any) -> Any:
@@ -158,6 +159,15 @@ def read_json_file(path: str, default: Any) -> Any:
 def write_json_file(path: str, data: Any) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, default=str)
+
+
+def today_yyyy_mm_dd() -> str:
+    return date.today().strftime("%Y-%m-%d")
+
+
+def contract_key(ticker: str, expiry: str, option_type: str, strike: float) -> str:
+    """Stable contract key for storing IV history."""
+    return f"{ticker.upper()}|{expiry}|{option_type.lower()}|{float(strike):.2f}"
 
 
 # -------------------- Snapshot Manager --------------------
@@ -178,7 +188,6 @@ class SnapshotManager:
         payload = read_json_file(self.path, {})
         if isinstance(payload, dict) and isinstance(payload.get("flows"), list):
             return payload["flows"]
-        # Backward-compat: if file is just a list
         if isinstance(payload, list):
             return payload
         return []
@@ -186,10 +195,7 @@ class SnapshotManager:
     def get_meta(self) -> Dict[str, Any]:
         payload = read_json_file(self.path, {})
         if isinstance(payload, dict):
-            return {
-                "saved_at_utc": payload.get("saved_at_utc"),
-                "count": payload.get("count"),
-            }
+            return {"saved_at_utc": payload.get("saved_at_utc"), "count": payload.get("count")}
         return {}
 
     def exists(self) -> bool:
@@ -203,6 +209,101 @@ class SnapshotManager:
                 return f.read()
         except Exception:
             return ""
+
+
+# -------------------- Local IV Store --------------------
+
+class LocalIVStore:
+    """
+    Stores IV history per contract in JSON:
+    {
+      "AAPL|2026-03-20|call|200.00": [
+        {"date":"2026-02-10","iv":45.2},
+        {"date":"2026-02-11","iv":48.1}
+      ],
+      ...
+    }
+    """
+    def __init__(self, path: str = IV_STORE_FILE):
+        self.path = path
+        ensure_json_file(self.path, default_value={})
+
+    def load_all(self) -> Dict[str, List[Dict[str, Any]]]:
+        data = read_json_file(self.path, {})
+        return data if isinstance(data, dict) else {}
+
+    def save_all(self, data: Dict[str, List[Dict[str, Any]]]) -> None:
+        write_json_file(self.path, data)
+
+    def upsert_today(self, key: str, iv_value: float) -> None:
+        if iv_value <= 0:
+            return
+        data = self.load_all()
+        rows = data.get(key, [])
+        if not isinstance(rows, list):
+            rows = []
+        t = today_yyyy_mm_dd()
+
+        # If today's entry exists, replace; else append
+        replaced = False
+        for r in rows:
+            if isinstance(r, dict) and r.get("date") == t:
+                r["iv"] = float(iv_value)
+                replaced = True
+                break
+        if not replaced:
+            rows.append({"date": t, "iv": float(iv_value)})
+
+        # Keep last 90 entries
+        rows = [r for r in rows if isinstance(r, dict) and r.get("date") and r.get("iv") is not None]
+        rows.sort(key=lambda r: r["date"])
+        rows = rows[-90:]
+
+        data[key] = rows
+        self.save_all(data)
+
+    def get_history(self, key: str) -> Dict[str, float]:
+        data = self.load_all()
+        rows = data.get(key, [])
+        out: Dict[str, float] = {}
+        if isinstance(rows, list):
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                d = str(r.get("date", ""))
+                iv = safe_float(r.get("iv", 0))
+                if d and iv > 0:
+                    out[d] = iv
+        return out
+
+    def detect_ramp(self, key: str, lookback_days: int = 3, require_strict: bool = True) -> Tuple[bool, List[Tuple[str, float]]]:
+        """
+        Ramp = last N daily IV values are increasing (strict by default).
+        Returns (is_ramping, last_points).
+        """
+        hist = self.get_history(key)
+        if len(hist) < lookback_days:
+            return False, []
+        dates_sorted = sorted(hist.keys())
+        last_dates = dates_sorted[-lookback_days:]
+        pts = [(d, float(hist[d])) for d in last_dates]
+
+        vals = [v for _, v in pts]
+        if require_strict:
+            ok = all(vals[i] < vals[i + 1] for i in range(len(vals) - 1))
+        else:
+            ok = all(vals[i] <= vals[i + 1] for i in range(len(vals) - 1))
+        return ok, pts
+
+    def raw_text(self) -> str:
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception:
+            return ""
+
+    def reset(self) -> None:
+        self.save_all({})
 
 
 # -------------------- API Clients --------------------
@@ -237,7 +338,7 @@ class UnusualWhalesAPI:
             return []
         return data.get("data", []) or []
 
-    def get_ticker_flow(self, ticker: str, limit: int = 120) -> List[Dict[str, Any]]:
+    def get_ticker_flow(self, ticker: str, limit: int = 180) -> List[Dict[str, Any]]:
         ticker = ticker.strip().upper()
         status, data, _ = http_get(
             f"{self.BASE_URL}/stock/{ticker}/options-flow",
@@ -287,10 +388,6 @@ class PolygonAPI:
         return 0.0, f"Error: {err or 'no data'}"
 
     def get_spot_at_time(self, ticker: str, timestamp_ct: str) -> Tuple[float, str]:
-        """
-        Get spot near trade time using minute bars; fallback to previous close.
-        timestamp_ct: 'YYYY-MM-DD HH:MM:SS AM CT'
-        """
         ticker = ticker.strip().upper()
         try:
             if not timestamp_ct or "CT" not in timestamp_ct:
@@ -379,9 +476,8 @@ class PolygonAPI:
 
 class EODHDAPI:
     """
-    EODHD IV:
-    - Marketplace historical IV endpoint commonly returns HTTP 422 (documented).
-      We try it, then fall back to current chain IV.
+    EODHD chain snapshot used for current IV.
+    We keep marketplace attempt out of the critical path; the scanner mainly uses chain IV.
     """
     BASE_URL = "https://eodhd.com/api"
 
@@ -397,51 +493,17 @@ class EODHDAPI:
             return True, "OK (EODHD)"
         return False, err or "Failed"
 
-    def get_iv_history(self, ticker: str, strike: float, expiry: str, option_type: str = "call") -> Dict[str, float]:
+    def get_iv_from_chain(self, ticker: str, strike: float, expiry: str, option_type: str) -> float:
+        """Return current IV% for a contract if found; else 0."""
         ticker = ticker.strip().upper()
         option_type = option_type.lower().strip()
-        try:
-            url = f"{self.BASE_URL}/mp/unicornbay/options/eod"
-            params = {
-                "api_token": self.api_key,
-                "fmt": "json",
-                "filter[underlying_symbol]": ticker,
-                "filter[type]": option_type,
-            }
-            status, data, _ = http_get(url, params=params)
-            if status == 200 and data:
-                records = data.get("data", data) if isinstance(data, dict) else data
-                iv_history: Dict[str, float] = {}
-                if isinstance(records, list):
-                    for record in records:
-                        attrs = record.get("attributes", record) if isinstance(record, dict) else {}
-                        rec_strike = safe_float(attrs.get("strike", 0))
-                        if abs(rec_strike - strike) > 1.0:
-                            continue
-                        rec_expiry = str(attrs.get("exp_date", "")) or str(attrs.get("expiration", ""))
-                        if rec_expiry != expiry:
-                            continue
-                        iv = attrs.get("volatility") or attrs.get("impliedVolatility") or 0
-                        trade_date = str(attrs.get("tradetime", "")).split("T")[0]
-                        if iv and trade_date:
-                            iv_val = safe_float(iv)
-                            if iv_val < 10:
-                                iv_val *= 100
-                            iv_history[trade_date] = iv_val
-                if iv_history:
-                    return iv_history
-            return self._get_iv_from_chain(ticker, strike, expiry, option_type)
-        except Exception:
-            return self._get_iv_from_chain(ticker, strike, expiry, option_type)
-
-    def _get_iv_from_chain(self, ticker: str, strike: float, expiry: str, option_type: str) -> Dict[str, float]:
-        ticker = ticker.strip().upper()
-        option_type = option_type.lower().strip()
+        if not self.api_key:
+            return 0.0
         try:
             url = f"{self.BASE_URL}/options/{ticker}.US"
             status, data, _ = http_get(url, params={"api_token": self.api_key, "fmt": "json"})
             if status != 200 or not data or not isinstance(data, dict):
-                return {}
+                return 0.0
 
             for exp_key, chain in data.items():
                 if expiry not in str(exp_key):
@@ -462,24 +524,35 @@ class EODHDAPI:
                     if abs(opt_strike - strike) < 0.5:
                         iv = safe_float(opt.get("impliedVolatility", 0))
                         if iv > 0:
+                            # Normalize: if it's 0.xx, treat as fraction
                             if iv < 1:
                                 iv *= 100
-                            today = datetime.now().strftime("%Y-%m-%d")
-                            return {today: iv}
-            return {}
+                            return float(iv)
+            return 0.0
         except Exception:
-            return {}
+            return 0.0
 
 
 # -------------------- Enrichment + Ladder --------------------
 
 class DataEnricher:
-    def __init__(self, uw: UnusualWhalesAPI, polygon: PolygonAPI, eodhd: EODHDAPI):
+    def __init__(
+        self,
+        uw: UnusualWhalesAPI,
+        polygon: PolygonAPI,
+        eodhd: EODHDAPI,
+        iv_store: LocalIVStore,
+        iv_lookback_days: int = 3,
+        iv_require_strict: bool = True,
+    ):
         self.uw = uw
         self.polygon = polygon
         self.eodhd = eodhd
+        self.iv_store = iv_store
+        self.iv_lookback_days = iv_lookback_days
+        self.iv_require_strict = iv_require_strict
 
-    def enrich_trade(self, raw_flow: Dict[str, Any], fetch_iv: bool = True) -> Dict[str, Any]:
+    def enrich_trade(self, raw_flow: Dict[str, Any], use_iv: bool = True) -> Dict[str, Any]:
         ticker = str(raw_flow.get("ticker", "")).upper()
         strike = safe_float(raw_flow.get("strike", 0))
         option_type = str(raw_flow.get("option_type", "call")).lower()
@@ -514,7 +587,7 @@ class DataEnricher:
         oi = safe_int(raw_flow.get("open_interest", 0))
         vol_oi_ratio = (volume / oi) if oi > 0 else 999.0
 
-        # Premium % (package-style heuristic)
+        # Premium % heuristic
         denom = (spot * 100.0 * max(volume, 1)) if spot > 0 else 0.0
         premium_pct = (total_prem / denom * 100.0) if denom > 0 else 0.0
 
@@ -523,32 +596,37 @@ class DataEnricher:
         # S/R + wick
         sr_data = self.polygon.calculate_support_resistance(ticker, strike)
 
-        # IV history / ramp
-        iv_history: Dict[str, float] = {}
-        iv_ramping = False
-        if fetch_iv:
-            iv_history = self.eodhd.get_iv_history(ticker, strike, expiry, option_type)
-            if len(iv_history) >= 3:
-                dates = sorted(iv_history.keys())
-                vals = [iv_history[d] for d in dates[-3:]]
-                iv_ramping = all(vals[i] < vals[i + 1] for i in range(len(vals) - 1))
-
-        # Earnings catalyst window
-        earnings = self.uw.get_earnings(ticker)
+        # Earnings
         days_to_er: Optional[int] = None
-        if earnings:
-            today = datetime.now()
-            for er in earnings:
-                er_date_str = str(er.get("date", "")).strip()
-                try:
-                    er_date = datetime.strptime(er_date_str, "%Y-%m-%d")
-                    delta = (er_date - today).days
-                    if 0 <= delta <= 30:
-                        days_to_er = delta
-                        break
-                except Exception:
-                    continue
+        if self.uw.token:
+            earnings = self.uw.get_earnings(ticker)
+            if earnings:
+                today_dt = datetime.now()
+                for er in earnings:
+                    er_date_str = str(er.get("date", "")).strip()
+                    try:
+                        er_date = datetime.strptime(er_date_str, "%Y-%m-%d")
+                        delta = (er_date - today_dt).days
+                        if 0 <= delta <= 30:
+                            days_to_er = delta
+                            break
+                    except Exception:
+                        continue
 
+        # NEW: Current IV from chain + local IV history/ramp
+        ckey = contract_key(ticker, expiry, option_type, strike)
+        current_iv = 0.0
+        if use_iv and self.eodhd.api_key:
+            current_iv = self.eodhd.get_iv_from_chain(ticker, strike, expiry, option_type)
+            if current_iv > 0:
+                self.iv_store.upsert_today(ckey, current_iv)
+
+        local_iv_history = self.iv_store.get_history(ckey)  # date->iv
+        iv_ramping, ramp_points = self.iv_store.detect_ramp(
+            ckey, lookback_days=self.iv_lookback_days, require_strict=self.iv_require_strict
+        )
+
+        # Clean exception (as described)
         clean_exception = (
             ask_pct >= 70 and vol_oi_ratio > 1 and strike_dist_pct <= 7 and 2.5 <= premium_pct <= 5.0
         )
@@ -573,8 +651,13 @@ class DataEnricher:
             "wick_triggered": bool(sr_data.get("wick_triggered", False)),
             "support": safe_float(sr_data.get("support", 0)),
             "resistance": safe_float(sr_data.get("resistance", 0)),
-            "iv_history": iv_history,
-            "iv_ramping": iv_ramping,
+            # NEW fields
+            "contract_key": ckey,
+            "current_iv": float(current_iv),
+            "iv_history_local": local_iv_history,
+            "iv_ramping": bool(iv_ramping),
+            "iv_ramp_points": ramp_points,  # list of (date, iv)
+            "iv_ramp_lookback_days": int(self.iv_lookback_days),
             "days_to_earnings": days_to_er,
             "clean_exception": clean_exception,
             "has_sweep": bool(raw_flow.get("is_sweep", False)),
@@ -586,12 +669,6 @@ class DataEnricher:
 
 
 class LadderDetector:
-    """
-    Ladder detection:
-    - Requires same expiry + type
-    - Requires >= min_unique_strikes total strikes within recent_minutes (including target strike)
-    """
-
     def __init__(self, uw: UnusualWhalesAPI):
         self.uw = uw
 
@@ -604,6 +681,8 @@ class LadderDetector:
         recent_minutes: int = 90,
         min_unique_strikes: int = 3,
     ) -> Tuple[bool, List[float]]:
+        if not self.uw.token:
+            return False, []
         flows = self.uw.get_ticker_flow(ticker, limit=180)
         if not flows:
             return False, []
@@ -612,7 +691,6 @@ class LadderDetector:
         cutoff = now_utc - timedelta(minutes=recent_minutes)
 
         strikes: set[float] = {float(target_strike)}
-
         for f in flows:
             f_type = str(f.get("option_type", "")).lower().strip()
             f_expiry = str(f.get("expiry", "")).strip()
@@ -642,7 +720,7 @@ class V31ScoringEngine:
         penalties: List[str] = []
         record["category_tags"] = record.get("category_tags") or []
 
-        # Premium % of spot (heuristic)
+        # Premium % heuristic
         prem_pct = safe_float(record.get("premium_pct", 0))
         if 2.5 <= prem_pct <= 5.0:
             score += 2
@@ -701,11 +779,15 @@ class V31ScoringEngine:
             score -= 2
             penalties.append("Wick reversal strike (-2)")
 
-        # IV ramp
+        # NEW: IV ramp (from local history)
         iv_ramping = bool(record.get("iv_ramping", False))
         if iv_ramping:
             score += 1
-            factors.append("IV ramp detected (+1)")
+            pts = record.get("iv_ramp_points") or []
+            if isinstance(pts, list) and pts:
+                factors.append(f"IV ramp (local) (+1) {pts}")
+            else:
+                factors.append("IV ramp (local) (+1)")
 
         # Ladder/cluster
         ladder_role = str(record.get("ladder_role", "isolated")).lower()
@@ -730,7 +812,7 @@ class V31ScoringEngine:
             score += 1
             factors.append(f"Catalyst {days_to_er}d (+1)")
 
-        # Cap logic
+        # Cap logic (unlocks if local IV ramp is true)
         if iv_ramping:
             max_score = 12
         elif bool(record.get("clean_exception", False)):
@@ -740,8 +822,7 @@ class V31ScoringEngine:
 
         final_score = min(score, max_score)
 
-        # Verdict labels (improved UX)
-        # NOTE: keep scoring the same; just label 5 as WATCHLIST since queue threshold is >=5.
+        # Verdict labels
         if final_score >= 8:
             verdict = "HIGH CONVICTION"
             record["category_tags"].append("HighConviction")
@@ -765,6 +846,8 @@ class V31ScoringEngine:
             record["category_tags"].append("LonelyWhale")
         if isinstance(days_to_er, int) and days_to_er <= 10:
             record["category_tags"].append("PreER")
+        if safe_float(record.get("current_iv", 0)) > 0:
+            record["category_tags"].append("HasIV")
 
         record["predictive_score"] = int(final_score)
         record["max_score"] = int(max_score)
@@ -781,9 +864,9 @@ class QueueManager:
         self.pending_file = pending_file
         self.inverse_file = inverse_file
         self.validated_file = validated_file
-        ensure_json_file(self.pending_file)
-        ensure_json_file(self.inverse_file)
-        ensure_json_file(self.validated_file)
+        ensure_json_file(self.pending_file, default_value=[])
+        ensure_json_file(self.inverse_file, default_value=[])
+        ensure_json_file(self.validated_file, default_value=[])
 
     def load_queue(self, filepath: str) -> List[Dict[str, Any]]:
         if not os.path.exists(filepath):
@@ -820,15 +903,15 @@ class QueueManager:
 # -------------------- Streamlit UI --------------------
 
 st.set_page_config(page_title="v3.1 Options Flow Scanner", layout="wide")
-st.title("v3.1 Options Flow Scanner (Replay Mode)")
-st.caption("UW + Polygon + EODHD • v3.1 scoring • Live/Replay toggle • JSON queues")
+st.title("v3.1 Options Flow Scanner (Replay + Local IV Ramp)")
+st.caption("UW + Polygon + EODHD chain IV • Local IV history • Live/Replay toggle • JSON queues")
 
 snapshot = SnapshotManager(SNAPSHOT_FILE)
+iv_store = LocalIVStore(IV_STORE_FILE)
 
 with st.sidebar:
     st.header("Data Source")
     data_mode = st.toggle("Replay Mode (ON = use saved snapshot)", value=False)
-    st.caption("Use Replay Mode when the market is closed.")
     meta = snapshot.get_meta()
     if meta.get("saved_at_utc"):
         st.write(f"Snapshot saved: `{meta.get('saved_at_utc')}`")
@@ -844,18 +927,16 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Snapshot Tools")
-
-    # Upload snapshot JSON (optional)
     uploaded = st.file_uploader("Upload snapshot JSON (optional)", type=["json"])
     if uploaded is not None:
         try:
             up = json.loads(uploaded.read().decode("utf-8"))
             if isinstance(up, dict) and isinstance(up.get("flows"), list):
                 snapshot.save(up["flows"])
-                st.success("Uploaded snapshot saved as last_uw_flows.json")
+                st.success("Uploaded snapshot saved.")
             elif isinstance(up, list):
                 snapshot.save(up)
-                st.success("Uploaded list saved as last_uw_flows.json")
+                st.success("Uploaded snapshot saved.")
             else:
                 st.error("Snapshot format not recognized.")
         except Exception as e:
@@ -871,11 +952,28 @@ with st.sidebar:
         )
 
     st.divider()
+    st.subheader("Local IV Store")
+    st.caption("This is how we build IV ramp for FREE (store IV daily).")
+    if st.button("Download IV store", use_container_width=True):
+        st.download_button(
+            "Click to download iv_history_store.json",
+            data=iv_store.raw_text(),
+            file_name="iv_history_store.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+    if st.button("Reset IV store (danger)", type="secondary", use_container_width=True):
+        iv_store.reset()
+        st.warning("IV store reset.")
+
+    st.divider()
+    st.subheader("IV Ramp Settings")
+    iv_lookback_days = st.slider("Ramp lookback days", 3, 10, 3, 1)
+    iv_strict = st.checkbox("Require strictly increasing IV", value=True)
+
+    st.divider()
     st.subheader("Scan Controls")
-
-    mode = st.radio("IV Mode", ["Full (try IV)", "Quick (skip IV)"], index=0)
-    fetch_iv = (mode.startswith("Full"))
-
+    use_iv = st.checkbox("Use IV (EODHD chain) + store locally", value=True)
     limit = st.slider("UW flow alerts limit (Live only)", min_value=10, max_value=250, value=200, step=10)
 
     min_premium = st.number_input("Min premium ($)", min_value=0, value=25_000, step=5_000)
@@ -896,18 +994,19 @@ with st.sidebar:
     inverse_path = st.text_input("Inverse file", value=INVERSE_SIGNALS_FILE)
     validated_path = st.text_input("Validated file", value=VALIDATED_TRADES_FILE)
 
-    st.divider()
-    st.subheader("About IV ramp")
-    st.info(
-        "EODHD historical IV marketplace endpoint commonly returns HTTP 422, so IV ramp detection usually "
-        "falls back to chain snapshot (current IV only). Scores are capped at 6 unless Clean Exception applies (cap 7)."
-    )
-
 # Instantiate
 uw = UnusualWhalesAPI(uw_token)
 polygon = PolygonAPI(polygon_key)
 eodhd = EODHDAPI(eodhd_key)
-enricher = DataEnricher(uw, polygon, eodhd)
+
+enricher = DataEnricher(
+    uw=uw,
+    polygon=polygon,
+    eodhd=eodhd,
+    iv_store=iv_store,
+    iv_lookback_days=int(iv_lookback_days),
+    iv_require_strict=bool(iv_strict),
+)
 scorer = V31ScoringEngine()
 ladder = LadderDetector(uw)
 queue = QueueManager(pending_path, inverse_path, validated_path)
@@ -916,13 +1015,9 @@ tabs = st.tabs(["Scan", "Manual Score", "Validate T+1", "Queues", "Connections"]
 
 
 def get_source_flows() -> Tuple[List[Dict[str, Any]], str]:
-    """Return (flows, source_label)."""
     if data_mode:
-        flows = snapshot.load()
-        return flows, "Replay (snapshot)"
-    else:
-        flows = uw.get_flows(limit=limit)
-        return flows, "Live (UW API)"
+        return snapshot.load(), "Replay (snapshot)"
+    return uw.get_flows(limit=limit), "Live (UW API)"
 
 
 # -------------------- Scan --------------------
@@ -932,42 +1027,31 @@ with tabs[0]:
     colA, colB = st.columns([1, 2], gap="large")
     with colA:
         run = st.button("Run scan", type="primary", use_container_width=True)
-        st.caption("Market closed? Turn ON Replay Mode so you can still test.")
+        st.caption("Market closed? Turn ON Replay Mode.")
     with colB:
         st.markdown(
             """
-            **What this does**
-            - Gets UW flows (Live or Snapshot)
-            - Filters: min premium + exclusions + min size + min vol/oi (+ optional vol>OI)
-            - Enriches: Polygon spot + S/R + wick, UW earnings, optional EODHD IV
-            - Ladder detection within recent time window
-            - Scores v3.1 and writes queues:
-              - pending (score >= 5), inverse (score <= -3)
-            """
+- Pulls UW flows (Live or Snapshot)
+- Filters: min premium + exclusions + min size + min vol/oi (+ optional vol>OI)
+- Enriches: Polygon spot + S/R + wick + (optional) EODHD chain IV
+- Stores IV daily locally and detects IV ramp from YOUR history
+- Scores v3.1 and writes queues:
+  - pending (score >= 5), inverse (score <= -3)
+"""
         )
 
     if run:
-        # In replay mode, we don't need keys; but enrichment still needs Polygon/EODHD/UW earnings/ladder.
-        # We'll allow scoring with whatever keys are available, and degrade gracefully.
         if not data_mode and not uw_token:
-            st.error("Live Mode requires UW_TOKEN (set in Secrets).")
+            st.error("Live Mode requires UW_TOKEN.")
         else:
-            skip_reasons = {
-                "premium": 0,
-                "excluded": 0,
-                "vol_oi": 0,
-                "min_size": 0,
-                "min_vol_oi": 0,
-                "bad_ticker": 0,
-            }
+            skip_reasons = {"premium": 0, "excluded": 0, "vol_oi": 0, "min_size": 0, "min_vol_oi": 0, "bad_ticker": 0}
 
             with st.spinner("Loading flows..."):
                 flows, src = get_source_flows()
 
             if not flows:
-                st.warning(f"No flows available from {src}. If using Replay Mode, run Live once to create a snapshot.")
+                st.warning(f"No flows from {src}. If Replay Mode is ON, run Live once to create a snapshot.")
             else:
-                # Auto-save snapshot whenever Live Mode pulls successfully
                 if not data_mode:
                     try:
                         snapshot.save(flows)
@@ -1021,22 +1105,21 @@ with tabs[0]:
                             skip_reasons["min_vol_oi"] += 1
                             continue
 
-                        # Enrich (will use keys if present; Polygon/EODHD calls may fail if keys missing)
-                        enriched = enricher.enrich_trade(f, fetch_iv=bool(fetch_iv and eodhd_key))
+                        # Enrich (IV optional)
+                        enriched = enricher.enrich_trade(f, use_iv=bool(use_iv and eodhd_key))
 
-                        # Ladder only if UW token exists (needs ticker flow)
-                        if uw_token:
-                            is_ladder, related = ladder.detect(
-                                ticker=enriched["ticker"],
-                                target_strike=enriched["strike"],
-                                option_type=enriched["option_type"],
-                                expiry=enriched["expiry"],
-                                recent_minutes=int(ladder_minutes),
-                                min_unique_strikes=int(ladder_min_strikes),
-                            )
-                            if is_ladder:
-                                enriched["ladder_role"] = "ladder"
-                                enriched["related_strikes"] = related
+                        # Ladder optional (needs UW token)
+                        is_ladder, related = ladder.detect(
+                            ticker=enriched["ticker"],
+                            target_strike=enriched["strike"],
+                            option_type=enriched["option_type"],
+                            expiry=enriched["expiry"],
+                            recent_minutes=int(ladder_minutes),
+                            min_unique_strikes=int(ladder_min_strikes),
+                        )
+                        if is_ladder:
+                            enriched["ladder_role"] = "ladder"
+                            enriched["related_strikes"] = related
 
                         scored = scorer.score(enriched)
                         results.append(scored)
@@ -1069,9 +1152,10 @@ with tabs[0]:
                                 "Prem%": round(safe_float(r.get("premium_pct", 0.0)), 2),
                                 "Ask%": round(safe_float(r.get("ask_pct", 0.0)), 1),
                                 "Vol/OI": round(safe_float(r.get("vol_oi_ratio", 0.0)), 2),
+                                "IV%": round(safe_float(r.get("current_iv", 0.0)), 2),
+                                "IVRamp": bool(r.get("iv_ramping", False)),
                                 "Wick": bool(r.get("wick_triggered", False)),
                                 "Ladder": (r.get("ladder_role") != "isolated"),
-                                "IVRamp": bool(r.get("iv_ramping", False)),
                                 "Score": r.get("predictive_score"),
                                 "Max": r.get("max_score"),
                                 "Verdict": r.get("verdict"),
@@ -1094,6 +1178,7 @@ with tabs[0]:
                                 st.write("**Spot**", round(safe_float(r.get("spot", 0)), 2))
                                 st.write("**Spot Source**", r.get("spot_source"))
                                 st.write("**DTE**", r.get("dte"))
+                                st.write("**Contract Key**", r.get("contract_key"))
                             with c2:
                                 st.write("**Premium**", pretty_money(safe_float(r.get("total_premium", 0))))
                                 st.write("**Prem %**", f"{safe_float(r.get('premium_pct', 0)):.2f}%")
@@ -1101,24 +1186,21 @@ with tabs[0]:
                                 st.write("**Vol/OI**", f"{safe_float(r.get('vol_oi_ratio', 0)):.2f}x")
                                 st.write("**Sweep**", bool(r.get("has_sweep", False)))
                             with c3:
-                                st.write("**Strike dist %**", f"{safe_float(r.get('strike_dist_pct', 0)):.2f}%")
-                                st.write("**Wick triggered**", bool(r.get("wick_triggered", False)))
-                                st.write(
-                                    "**Support / Resistance**",
-                                    (round(safe_float(r.get("support", 0)), 2), round(safe_float(r.get("resistance", 0)), 2)),
-                                )
+                                st.write("**IV (current)**", f"{safe_float(r.get('current_iv', 0)):.2f}%")
+                                st.write("**IV Ramp**", bool(r.get("iv_ramping", False)))
+                                st.write("**IV Ramp Points**", r.get("iv_ramp_points"))
+                                st.write("**Earnings (days)**", r.get("days_to_earnings"))
                                 st.write("**Ladder**", r.get("ladder_role", "isolated"))
                                 if r.get("related_strikes"):
                                     st.write("**Related strikes**", r.get("related_strikes"))
-                                st.write("**Earnings (days)**", r.get("days_to_earnings"))
 
                             st.write("**Factors**")
                             st.write("\n".join([f"• {x}" for x in r.get("score_factors", [])]) or "—")
                             st.write("**Penalties**")
                             st.write("\n".join([f"• {x}" for x in r.get("score_penalties", [])]) or "—")
 
-                            st.write("**IV history (if any)**")
-                            st.json(r.get("iv_history", {}))
+                            st.write("**Local IV history (date -> IV%)**")
+                            st.json(r.get("iv_history_local", {}))
 
                             st.write("**Raw UW (debug)**")
                             st.json(r.get("_raw", {}))
@@ -1145,9 +1227,9 @@ with tabs[1]:
 
     raw_text = st.text_area("Trade JSON", value=json.dumps(sample, indent=2), height=260)
 
-    do_enrich = st.checkbox("Enrich using APIs (Polygon/EODHD/Earnings)", value=True)
-    do_ladder = st.checkbox("Run ladder detection (UW ticker flow)", value=False)
-    do_iv = st.checkbox("Fetch IV (EODHD)", value=True)
+    do_enrich = st.checkbox("Enrich using APIs", value=True)
+    do_ladder = st.checkbox("Run ladder detection", value=False)
+    do_iv = st.checkbox("Use IV + store locally", value=True)
 
     if st.button("Score this trade", type="primary"):
         try:
@@ -1156,8 +1238,8 @@ with tabs[1]:
                 raise ValueError("JSON must be an object")
 
             if do_enrich:
-                enriched = enricher.enrich_trade(raw_flow, fetch_iv=bool(do_iv and eodhd_key))
-                if do_ladder and uw_token:
+                enriched = enricher.enrich_trade(raw_flow, use_iv=bool(do_iv and eodhd_key))
+                if do_ladder:
                     is_l, rel = ladder.detect(
                         ticker=enriched["ticker"],
                         target_strike=enriched["strike"],
@@ -1169,6 +1251,7 @@ with tabs[1]:
                     if is_l:
                         enriched["ladder_role"] = "ladder"
                         enriched["related_strikes"] = rel
+
                 scored = scorer.score(enriched)
                 st.success(f"Score: {scored['predictive_score']} / max {scored['max_score']} • {scored['verdict']}")
                 st.json(scored)
@@ -1200,7 +1283,7 @@ with tabs[2]:
             {k: trade.get(k) for k in [
                 "ticker", "option_type", "strike", "expiry", "entry_timestamp",
                 "predictive_score", "max_score", "verdict", "premium_pct", "ask_pct",
-                "volume", "open_interest", "iv_history", "iv_ramping", "clean_exception"
+                "volume", "open_interest", "current_iv", "iv_ramping", "contract_key"
             ]}
         )
 
@@ -1210,7 +1293,7 @@ with tabs[2]:
             prior_oi = st.number_input("Prior-day OI", min_value=0, value=int(trade.get("open_interest", 0)), step=1)
             t1_oi = st.number_input("T+1 OI", min_value=0, value=int(trade.get("open_interest", 0)), step=1)
         with c2:
-            iv_entry = st.number_input("Entry-day IV (%)", min_value=0.0, value=0.0, step=0.5)
+            iv_entry = st.number_input("Entry-day IV (%)", min_value=0.0, value=float(trade.get("current_iv", 0.0)), step=0.5)
             iv_t1 = st.number_input("T+1 IV (%)", min_value=0.0, value=0.0, step=0.5)
         with c3:
             roll_override = st.checkbox("Roll override context (manual)", value=False)
@@ -1266,7 +1349,6 @@ with tabs[2]:
                 t["validated_verdict"] = "TRAP / SKIP"
 
             queue.add_validated(t)
-
             pending.pop(idx)
             queue.save_queue(pending_path, pending)
 
@@ -1347,11 +1429,12 @@ with tabs[4]:
     st.divider()
     st.markdown(
         """
-**Why you might see lots of WATCHLIST/TRAP when market is closed**
-- UW alerts after-hours can be thinner, older, or have incomplete side fields  
-- IV ramp is usually unavailable (EODHD historical endpoint issue), so scores cap at 6/7  
-- That naturally clusters many signals around 4–6  
+**How IV ramp works now (FREE)**
+- Each time you scan, the app pulls **current IV** from EODHD chain for each contract found
+- It stores one IV value per day in `iv_history_store.json`
+- After you have at least **3 days** saved for a contract, the app can detect **IV ramp**
+- When ramp is detected, max score cap unlocks (up to 12)
 
-If you want more “TRADEABLE/HIGH” results, run scans during market hours and use Replay Mode later.
+Tip: run at least 1 scan per day during market hours to build the IV history faster.
 """
     )
