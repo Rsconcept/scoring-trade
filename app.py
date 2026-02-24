@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 """
-Streamlit v3.2 Options Flow Scanner (Replay Mode + Local IV History + Polygon ATM IV 7D)
-======================================================================================
-Fix included:
-- Correct Polygon option snapshot endpoint:
-    /v3/snapshot/options/{underlying}/{option_contract}
-  (the previous version used the wrong path, causing Underlying IV to stay 0)
+Streamlit v3.3 Options Flow Scanner (Replay + Contract IV + Underlying ATM IV 7D)
+================================================================================
+Key upgrade (fix for "IV always 0"):
+- Underlying ATM IV is now computed from EODHD OPTIONS CHAIN (not Polygon).
+  This avoids Polygon plan/coverage limitations for greeks/IV snapshots.
 
-What it does:
-- UW flows (live or replay snapshot)
-- Polygon spot + S/R
-- Optional: EODHD per-contract IV
-- NEW: Polygon Underlying ATM IV (nearest expiry within a DTE window) + store daily
-- Local JSON store builds 7-day IV history + ramp detection
+What you get:
+- Contract IV (EODHD chain) per UW flow contract (same as before)
+- Underlying ATM IV (EODHD chain) per ticker (nearest expiry within DTE window, strike closest to spot)
+- Local JSON store builds 7D history + IV ramp detection (free, persistent only if filesystem persists)
 
 Secrets:
 UW_TOKEN, POLYGON_API_KEY, EODHD_API_KEY
@@ -28,14 +25,13 @@ import json
 import os
 from datetime import datetime, timedelta, timezone, date
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote
 
 import requests
 import streamlit as st
 
 # -------------------- Constants --------------------
 
-CT_OFFSET = -6  # Central Time offset
+CT_OFFSET = -6
 MAX_PENDING_TRADES = 50
 
 PENDING_TRADES_FILE = "pending_trades.json"
@@ -164,7 +160,7 @@ def contract_key(ticker: str, expiry: str, option_type: str, strike: float) -> s
 
 
 def underlying_iv_key(ticker: str) -> str:
-    return f"{ticker.upper()}|UNDERLYING_IV"
+    return f"{ticker.upper()}|UNDERLYING_ATM_IV"
 
 
 # -------------------- Snapshot Manager --------------------
@@ -212,10 +208,10 @@ class SnapshotManager:
 
 class LocalIVStore:
     """
-    Stores IV history per key in JSON:
+    Stores IV history per key:
     {
       "AAPL|2026-03-20|call|200.00": [{"date":"2026-02-10","iv":45.2}, ...],
-      "AAPL|UNDERLYING_IV": [{"date":"2026-02-10","iv":28.4}, ...]
+      "AAPL|UNDERLYING_ATM_IV": [{"date":"2026-02-10","iv":28.4}, ...]
     }
     """
     def __init__(self, path: str = IV_STORE_FILE):
@@ -229,7 +225,7 @@ class LocalIVStore:
     def save_all(self, data: Dict[str, List[Dict[str, Any]]]) -> None:
         write_json_file(self.path, data)
 
-    def upsert_date(self, key: str, date_yyyy_mm_dd: str, iv_value: float) -> None:
+    def upsert_today(self, key: str, iv_value: float) -> None:
         if iv_value <= 0:
             return
         data = self.load_all()
@@ -237,14 +233,15 @@ class LocalIVStore:
         if not isinstance(rows, list):
             rows = []
 
+        t = today_yyyy_mm_dd()
         replaced = False
         for r in rows:
-            if isinstance(r, dict) and r.get("date") == date_yyyy_mm_dd:
+            if isinstance(r, dict) and r.get("date") == t:
                 r["iv"] = float(iv_value)
                 replaced = True
                 break
         if not replaced:
-            rows.append({"date": date_yyyy_mm_dd, "iv": float(iv_value)})
+            rows.append({"date": t, "iv": float(iv_value)})
 
         rows = [r for r in rows if isinstance(r, dict) and r.get("date") and r.get("iv") is not None]
         rows.sort(key=lambda r: r["date"])
@@ -252,9 +249,6 @@ class LocalIVStore:
 
         data[key] = rows
         self.save_all(data)
-
-    def upsert_today(self, key: str, iv_value: float) -> None:
-        self.upsert_date(key, today_yyyy_mm_dd(), iv_value)
 
     def get_history(self, key: str) -> Dict[str, float]:
         data = self.load_all()
@@ -467,143 +461,18 @@ class PolygonAPI:
             "wick_triggered": wick_triggered,
         }
 
-    # ---------- NEW: Polygon ATM IV (Underlying) ----------
-
-    def _closest_strike(self, strikes: List[float], spot: float) -> Optional[float]:
-        if not strikes or spot <= 0:
-            return None
-        return min(strikes, key=lambda s: abs(s - spot))
-
-    def _contract_ticker_polygon_format(self, underlying: str, expiry: str, option_type: str, strike: float) -> str:
-        # Polygon contract ticker format: O:{UNDERLYING}{YYMMDD}{C/P}{strike*1000 padded to 8}
-        underlying = underlying.upper().strip()
-        option_type = option_type.lower().strip()
-        yy = expiry[2:4]
-        mm = expiry[5:7]
-        dd = expiry[8:10]
-        cp = "C" if option_type == "call" else "P"
-        strike_int = int(round(float(strike) * 1000))
-        strike_str = f"{strike_int:08d}"
-        return f"O:{underlying}{yy}{mm}{dd}{cp}{strike_str}"
-
-    def _get_contract_snapshot_iv(self, underlying: str, option_contract: str) -> float:
-        """
-        FIX: Correct Polygon endpoint is:
-          /v3/snapshot/options/{underlying}/{option_contract}
-
-        NOTE: option_contract contains ":" -> must be URL-encoded for path.
-        """
-        underlying = underlying.upper().strip()
-        option_contract = option_contract.strip()
-        if not underlying or not option_contract:
-            return 0.0
-
-        oc = quote(option_contract, safe="")  # encode ":" and other unsafe chars in path segment
-        url = f"{self.BASE_URL}/v3/snapshot/options/{underlying}/{oc}"
-
-        status, data, _ = http_get(url, params={"apiKey": self.api_key})
-        if status != 200 or not data or not isinstance(data, dict):
-            return 0.0
-
-        try:
-            res = data.get("results")
-            if not isinstance(res, dict):
-                return 0.0
-
-            greeks = res.get("greeks") or {}
-            iv = safe_float(greeks.get("iv", 0.0))  # often fraction (0.25)
-
-            if iv > 0:
-                return iv * 100.0 if iv < 1 else iv
-
-            iv2 = safe_float(res.get("implied_volatility", 0.0))
-            if iv2 > 0:
-                return iv2 * 100.0 if iv2 < 1 else iv2
-        except Exception:
-            return 0.0
-
-        return 0.0
-
-    def get_underlying_atm_iv_today(
-        self,
-        ticker: str,
-        spot: float,
-        dte_min: int = 7,
-        dte_max: int = 30,
-        prefer_expiry_min_dte: bool = True,
-    ) -> Tuple[float, str]:
-        """
-        Compute a CLEAN "ATM IV" for the underlying:
-        - Find expirations in [dte_min, dte_max]
-        - Choose the nearest expiry
-        - Choose closest strike to spot
-        - Pull contract snapshot IV via Polygon
-        """
-        ticker = ticker.strip().upper()
-        if not self.api_key or spot <= 0:
-            return 0.0, "Polygon IV: missing key or spot"
-
-        url = f"{self.BASE_URL}/v3/reference/options/contracts"
-        params = {
-            "apiKey": self.api_key,
-            "underlying_ticker": ticker,
-            "limit": 1000,
-            "sort": "expiration_date",
-            "order": "asc",
-        }
-        status, data, err = http_get(url, params=params)
-        if status != 200 or not data or not isinstance(data, dict):
-            return 0.0, f"Polygon IV: contracts list failed {err}"
-
-        results = data.get("results") or []
-        if not isinstance(results, list) or not results:
-            return 0.0, "Polygon IV: no contracts"
-
-        exp_to_strikes: Dict[str, List[float]] = {}
-        for c in results:
-            if not isinstance(c, dict):
-                continue
-            exp = str(c.get("expiration_date", "")).strip()
-            if not exp or len(exp) != 10:
-                continue
-            dte = calculate_dte(exp)
-            if dte < dte_min or dte > dte_max:
-                continue
-            strike = safe_float(c.get("strike_price", 0.0))
-            if strike <= 0:
-                continue
-            exp_to_strikes.setdefault(exp, []).append(float(strike))
-
-        if not exp_to_strikes:
-            return 0.0, f"Polygon IV: no expirations in {dte_min}-{dte_max} DTE"
-
-        expiries_sorted = sorted(exp_to_strikes.keys(), key=lambda e: calculate_dte(e))
-        chosen_expiry = expiries_sorted[0] if prefer_expiry_min_dte else expiries_sorted[len(expiries_sorted)//2]
-
-        strikes = sorted(list(set(exp_to_strikes[chosen_expiry])))
-        atm_strike = self._closest_strike(strikes, spot)
-        if atm_strike is None:
-            return 0.0, "Polygon IV: no strikes"
-
-        # CALL snapshot first; PUT fallback
-        call_contract = self._contract_ticker_polygon_format(ticker, chosen_expiry, "call", atm_strike)
-        iv_pct = self._get_contract_snapshot_iv(ticker, call_contract)
-        if iv_pct > 0:
-            return iv_pct, f"Polygon ATM IV CALL {chosen_expiry} strike {atm_strike}"
-
-        put_contract = self._contract_ticker_polygon_format(ticker, chosen_expiry, "put", atm_strike)
-        iv_pct2 = self._get_contract_snapshot_iv(ticker, put_contract)
-        if iv_pct2 > 0:
-            return iv_pct2, f"Polygon ATM IV PUT {chosen_expiry} strike {atm_strike}"
-
-        return 0.0, f"Polygon IV snapshot missing (plan/endpoint) {chosen_expiry} strike {atm_strike}"
-
 
 class EODHDAPI:
+    """
+    EODHD chain is our IV truth source:
+    - Contract IV: find exact strike/expiry/type
+    - Underlying ATM IV: choose expiry in window + strike nearest spot
+    """
     BASE_URL = "https://eodhd.com/api"
 
     def __init__(self, api_key: str):
         self.api_key = api_key.strip()
+        self._chain_cache: Dict[str, Dict[str, Any]] = {}  # ticker -> raw chain dict
 
     def test_connection(self) -> Tuple[bool, str]:
         status, data, err = http_get(
@@ -614,42 +483,169 @@ class EODHDAPI:
             return True, "OK (EODHD)"
         return False, err or "Failed"
 
+    def get_options_chain(self, ticker: str) -> Tuple[Optional[Dict[str, Any]], str]:
+        ticker = ticker.strip().upper()
+        if not self.api_key:
+            return None, "EODHD: missing api key"
+        if ticker in self._chain_cache:
+            return self._chain_cache[ticker], "EODHD chain (cached)"
+        url = f"{self.BASE_URL}/options/{ticker}.US"
+        status, data, err = http_get(url, params={"api_token": self.api_key, "fmt": "json"}, timeout=30)
+        if status != 200 or not data or not isinstance(data, dict):
+            return None, f"EODHD chain error: {err or 'no data'}"
+        self._chain_cache[ticker] = data
+        return data, "EODHD chain (fresh)"
+
+    def _normalize_iv_pct(self, iv: float) -> float:
+        if iv <= 0:
+            return 0.0
+        return iv * 100.0 if iv < 1 else iv
+
     def get_iv_from_chain(self, ticker: str, strike: float, expiry: str, option_type: str) -> float:
+        """Return current IV% for a contract if found; else 0."""
         ticker = ticker.strip().upper()
         option_type = option_type.lower().strip()
-        if not self.api_key:
+
+        chain, _src = self.get_options_chain(ticker)
+        if not chain:
             return 0.0
-        try:
-            url = f"{self.BASE_URL}/options/{ticker}.US"
-            status, data, _ = http_get(url, params={"api_token": self.api_key, "fmt": "json"})
-            if status != 200 or not data or not isinstance(data, dict):
+
+        # EODHD keys are expirations (strings). We match by substring.
+        for exp_key, exp_payload in chain.items():
+            if expiry not in str(exp_key):
+                continue
+            if not isinstance(exp_payload, dict):
+                continue
+
+            options_list = exp_payload.get(option_type + "s", [])
+            if isinstance(options_list, dict):
+                options_list = list(options_list.values())
+            if not isinstance(options_list, list):
+                continue
+
+            best_iv = 0.0
+            best_diff = 1e9
+            for opt in options_list:
+                if not isinstance(opt, dict):
+                    continue
+                opt_strike = safe_float(opt.get("strike", 0))
+                diff = abs(opt_strike - strike)
+                if diff < best_diff:
+                    best_diff = diff
+                    iv = self._normalize_iv_pct(safe_float(opt.get("impliedVolatility", 0)))
+                    best_iv = iv
+
+            # Only accept if strike is close enough (handles decimal strikes)
+            if best_diff <= 0.51:
+                return float(best_iv)
+
+        return 0.0
+
+    def get_underlying_atm_iv(
+        self,
+        ticker: str,
+        spot: float,
+        dte_min: int = 7,
+        dte_max: int = 30,
+        prefer_nearest_expiry: bool = True,
+    ) -> Tuple[float, str, Dict[str, Any]]:
+        """
+        Underlying ATM IV from EODHD chain:
+        - Filter expiries within [dte_min, dte_max]
+        - Choose nearest expiry (default)
+        - Choose strike closest to spot
+        - Take CALL IV, fallback to PUT IV
+        Returns: (iv_pct, source_string, debug_dict)
+        """
+        dbg: Dict[str, Any] = {"ticker": ticker, "spot": spot, "dte_min": dte_min, "dte_max": dte_max}
+        if spot <= 0:
+            return 0.0, "EODHD ATM IV: missing spot", dbg
+
+        chain, src = self.get_options_chain(ticker)
+        dbg["chain_source"] = src
+        if not chain:
+            return 0.0, "EODHD ATM IV: no chain", dbg
+
+        expiries: List[str] = []
+        for exp_key in chain.keys():
+            exp = str(exp_key)[:10]
+            if len(exp) == 10 and exp[4] == "-" and exp[7] == "-":
+                dte = calculate_dte(exp)
+                if dte_min <= dte <= dte_max:
+                    expiries.append(exp)
+
+        expiries = sorted(set(expiries), key=lambda e: calculate_dte(e))
+        dbg["eligible_expiries"] = expiries[:20]
+        if not expiries:
+            return 0.0, f"EODHD ATM IV: no expiries in {dte_min}-{dte_max} DTE", dbg
+
+        expiry = expiries[0] if prefer_nearest_expiry else expiries[len(expiries) // 2]
+        dbg["chosen_expiry"] = expiry
+
+        exp_payload = None
+        # find the raw key that contains this expiry
+        for exp_key, payload in chain.items():
+            if expiry in str(exp_key) and isinstance(payload, dict):
+                exp_payload = payload
+                break
+        if not exp_payload:
+            return 0.0, "EODHD ATM IV: expiry payload missing", dbg
+
+        calls = exp_payload.get("calls", [])
+        puts = exp_payload.get("puts", [])
+        if isinstance(calls, dict):
+            calls = list(calls.values())
+        if isinstance(puts, dict):
+            puts = list(puts.values())
+
+        # Collect strikes
+        strikes: List[float] = []
+        for o in (calls if isinstance(calls, list) else []):
+            if isinstance(o, dict):
+                s = safe_float(o.get("strike", 0))
+                if s > 0:
+                    strikes.append(s)
+        if not strikes:
+            for o in (puts if isinstance(puts, list) else []):
+                if isinstance(o, dict):
+                    s = safe_float(o.get("strike", 0))
+                    if s > 0:
+                        strikes.append(s)
+
+        strikes = sorted(set(strikes))
+        if not strikes:
+            return 0.0, "EODHD ATM IV: no strikes", dbg
+
+        atm = min(strikes, key=lambda s: abs(s - spot))
+        dbg["atm_strike"] = atm
+
+        # Pull IV from nearest strike row
+        def nearest_iv(options_list: Any) -> float:
+            if not isinstance(options_list, list) or not options_list:
                 return 0.0
-
-            for exp_key, chain in data.items():
-                if expiry not in str(exp_key):
+            best_iv = 0.0
+            best_diff = 1e9
+            for opt in options_list:
+                if not isinstance(opt, dict):
                     continue
-                if not isinstance(chain, dict):
-                    continue
+                s = safe_float(opt.get("strike", 0))
+                diff = abs(s - atm)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_iv = self._normalize_iv_pct(safe_float(opt.get("impliedVolatility", 0)))
+            return float(best_iv) if best_diff <= 0.51 else 0.0
 
-                options_list = chain.get(option_type + "s", [])
-                if isinstance(options_list, dict):
-                    options_list = list(options_list.values())
-                if not isinstance(options_list, list):
-                    continue
+        iv_call = nearest_iv(calls)
+        iv_put = nearest_iv(puts)
+        dbg["iv_call"] = iv_call
+        dbg["iv_put"] = iv_put
 
-                for opt in options_list:
-                    if not isinstance(opt, dict):
-                        continue
-                    opt_strike = safe_float(opt.get("strike", 0))
-                    if abs(opt_strike - strike) < 0.5:
-                        iv = safe_float(opt.get("impliedVolatility", 0))
-                        if iv > 0:
-                            if iv < 1:
-                                iv *= 100
-                            return float(iv)
-            return 0.0
-        except Exception:
-            return 0.0
+        if iv_call > 0:
+            return iv_call, f"EODHD ATM IV CALL {expiry} {atm}", dbg
+        if iv_put > 0:
+            return iv_put, f"EODHD ATM IV PUT {expiry} {atm}", dbg
+
+        return 0.0, f"EODHD ATM IV: IV missing for {expiry} {atm}", dbg
 
 
 # -------------------- Enrichment + Ladder --------------------
@@ -675,7 +671,12 @@ class DataEnricher:
         self.underlying_iv_dte_min = underlying_iv_dte_min
         self.underlying_iv_dte_max = underlying_iv_dte_max
 
-    def enrich_trade(self, raw_flow: Dict[str, Any], use_iv: bool = True, use_underlying_iv: bool = True) -> Dict[str, Any]:
+    def enrich_trade(
+        self,
+        raw_flow: Dict[str, Any],
+        use_contract_iv: bool = True,
+        use_underlying_iv: bool = True
+    ) -> Dict[str, Any]:
         ticker = str(raw_flow.get("ticker", "")).upper()
         strike = safe_float(raw_flow.get("strike", 0))
         option_type = str(raw_flow.get("option_type", "call")).lower()
@@ -684,7 +685,7 @@ class DataEnricher:
 
         timestamp_ct = to_central_time(timestamp)
 
-        # Spot price
+        # Spot from Polygon
         spot, spot_source = self.polygon.get_spot_at_time(ticker, timestamp_ct)
 
         # Strike distance / OTM
@@ -740,9 +741,9 @@ class DataEnricher:
         ckey = contract_key(ticker, expiry, option_type, strike)
         ukey = underlying_iv_key(ticker)
 
-        # ---- Contract IV (EODHD) ----
+        # ---- Contract IV (EODHD exact contract) ----
         current_iv_contract = 0.0
-        if use_iv and self.eodhd.api_key:
+        if use_contract_iv and self.eodhd.api_key:
             current_iv_contract = self.eodhd.get_iv_from_chain(ticker, strike, expiry, option_type)
             if current_iv_contract > 0:
                 self.iv_store.upsert_today(ckey, current_iv_contract)
@@ -752,27 +753,30 @@ class DataEnricher:
             ckey, lookback_days=self.iv_lookback_days, require_strict=self.iv_require_strict
         )
 
-        # ---- Underlying ATM IV (Polygon) ----
+        # ---- Underlying ATM IV (EODHD chain) ----
         underlying_iv_current = 0.0
         underlying_iv_source = ""
-        if use_underlying_iv and self.polygon.api_key and spot > 0:
-            underlying_iv_current, underlying_iv_source = self.polygon.get_underlying_atm_iv_today(
+        underlying_iv_debug: Dict[str, Any] = {}
+
+        if use_underlying_iv and self.eodhd.api_key and spot > 0:
+            underlying_iv_current, underlying_iv_source, underlying_iv_debug = self.eodhd.get_underlying_atm_iv(
                 ticker=ticker,
                 spot=spot,
                 dte_min=self.underlying_iv_dte_min,
                 dte_max=self.underlying_iv_dte_max,
+                prefer_nearest_expiry=True,
             )
             if underlying_iv_current > 0:
                 self.iv_store.upsert_today(ukey, underlying_iv_current)
 
-        underlying_iv_points_7d = self.iv_store.last_n_points(ukey, 7)
-        underlying_iv_ramping, underlying_iv_ramp_pts = self.iv_store.detect_ramp(
-            ukey, lookback_days=max(3, min(10, self.iv_lookback_days)), require_strict=self.iv_require_strict
-        )
+        underlying_points_7d = self.iv_store.last_n_points(ukey, 7)
+        iv7d_change = 0.0
+        if len(underlying_points_7d) >= 2:
+            iv7d_change = float(underlying_points_7d[-1][1] - underlying_points_7d[0][1])
 
-        iv_7d_change = 0.0
-        if len(underlying_iv_points_7d) >= 2:
-            iv_7d_change = float(underlying_iv_points_7d[-1][1] - underlying_iv_points_7d[0][1])
+        underlying_ramping, underlying_ramp_pts = self.iv_store.detect_ramp(
+            ukey, lookback_days=self.iv_lookback_days, require_strict=self.iv_require_strict
+        )
 
         clean_exception = (
             ask_pct >= 70 and vol_oi_ratio > 1 and strike_dist_pct <= 7 and 2.5 <= premium_pct <= 5.0
@@ -810,10 +814,11 @@ class DataEnricher:
             "underlying_iv_key": ukey,
             "iv_underlying_current": float(underlying_iv_current),
             "iv_underlying_source": underlying_iv_source,
-            "iv_underlying_points_7d": underlying_iv_points_7d,
-            "iv_underlying_7d_change": float(iv_7d_change),
-            "iv_underlying_ramping": bool(underlying_iv_ramping),
-            "iv_underlying_ramp_points": underlying_iv_ramp_pts,
+            "iv_underlying_points_7d": underlying_points_7d,
+            "iv_underlying_7d_change": float(iv7d_change),
+            "iv_underlying_ramping": bool(underlying_ramping),
+            "iv_underlying_ramp_points": underlying_ramp_pts,
+            "iv_underlying_debug": underlying_iv_debug,
 
             "iv_ramp_lookback_days": int(self.iv_lookback_days),
             "days_to_earnings": days_to_er,
@@ -871,7 +876,7 @@ class LadderDetector:
 
 # -------------------- Scoring --------------------
 
-class V32ScoringEngine:
+class V33ScoringEngine:
     def score(self, record: Dict[str, Any]) -> Dict[str, Any]:
         score = 0
         factors: List[str] = []
@@ -888,16 +893,12 @@ class V32ScoringEngine:
         elif prem_pct < 1.0:
             score -= 2
             penalties.append(f"Ultra-low premium {prem_pct:.2f}% (-2)")
-        else:
-            factors.append(f"Excessive premium {prem_pct:.1f}% (0)")
 
         dist = safe_float(record.get("strike_dist_pct", 0))
         if dist <= 7:
             score += 2
             factors.append(f"Strike {dist:.1f}% OTM (+2)")
-        elif dist <= 15:
-            factors.append(f"Strike {dist:.1f}% OTM (0)")
-        else:
+        elif dist > 15:
             score -= 2
             penalties.append(f"Strike {dist:.1f}% deep OTM (-2)")
 
@@ -916,8 +917,6 @@ class V32ScoringEngine:
         elif 0 < ask_pct < 30:
             score -= 2
             penalties.append(f"Bid/mid heavy (Ask {ask_pct:.0f}%) (-2)")
-        else:
-            factors.append("Execution side unknown/neutral (0)")
 
         vol_oi = safe_float(record.get("vol_oi_ratio", 0))
         if vol_oi >= 2:
@@ -931,15 +930,13 @@ class V32ScoringEngine:
             score -= 2
             penalties.append("Wick reversal strike (-2)")
 
-        iv_under_ramp = bool(record.get("iv_underlying_ramping", False))
-        if iv_under_ramp:
+        # IV signals
+        if bool(record.get("iv_underlying_ramping", False)):
             score += 1
             factors.append(f"Underlying IV ramp (+1) {record.get('iv_underlying_ramp_points')}")
-        else:
-            iv_contract_ramp = bool(record.get("iv_ramping", False))
-            if iv_contract_ramp:
-                score += 1
-                factors.append(f"Contract IV ramp (+1) {record.get('iv_ramp_points')}")
+        elif bool(record.get("iv_ramping", False)):
+            score += 1
+            factors.append(f"Contract IV ramp (+1) {record.get('iv_ramp_points')}")
 
         iv7 = safe_float(record.get("iv_underlying_7d_change", 0.0))
         if iv7 >= 3.0:
@@ -969,7 +966,8 @@ class V32ScoringEngine:
             score += 1
             factors.append(f"Catalyst {days_to_er}d (+1)")
 
-        if iv_under_ramp or bool(record.get("iv_ramping", False)):
+        # Cap logic
+        if bool(record.get("iv_underlying_ramping", False)) or bool(record.get("iv_ramping", False)):
             max_score = 12
         elif bool(record.get("clean_exception", False)):
             max_score = 7
@@ -980,37 +978,26 @@ class V32ScoringEngine:
 
         if final_score >= 8:
             verdict = "HIGH CONVICTION"
-            record["category_tags"].append("HighConviction")
         elif final_score >= 7:
             verdict = "TRADEABLE"
-            record["category_tags"].append("Tradeable")
         elif final_score >= 6:
             verdict = "MODERATE"
-            record["category_tags"].append("Moderate")
         elif final_score >= 5:
             verdict = "WATCHLIST"
-            record["category_tags"].append("Watchlist")
         else:
             verdict = "TRAP / SKIP"
-            record["category_tags"].append("Trap")
-
-        if bool(record.get("has_sweep", False)):
-            record["category_tags"].append("Sweep")
-        if vol_oi >= 10:
-            record["category_tags"].append("LonelyWhale")
-        if isinstance(days_to_er, int) and days_to_er <= 10:
-            record["category_tags"].append("PreER")
-
-        if safe_float(record.get("iv_underlying_current", 0)) > 0:
-            record["category_tags"].append("HasUnderlyingIV")
-        if safe_float(record.get("current_iv", 0)) > 0:
-            record["category_tags"].append("HasContractIV")
 
         record["predictive_score"] = int(final_score)
         record["max_score"] = int(max_score)
         record["score_factors"] = factors
         record["score_penalties"] = penalties
         record["verdict"] = verdict
+
+        tags = record.get("category_tags", [])
+        tags.append("HasUnderlyingIV" if safe_float(record.get("iv_underlying_current", 0)) > 0 else "NoUnderlyingIV")
+        tags.append("HasContractIV" if safe_float(record.get("current_iv", 0)) > 0 else "NoContractIV")
+        record["category_tags"] = list(dict.fromkeys(tags))
+
         return record
 
 
@@ -1020,7 +1007,6 @@ class QueueManager:
     def __init__(self, pending_file: str, inverse_file: str, validated_file: str):
         self.pending_file = pending_file
         self.inverse_file = inverse_file
-        self.validated_file = inverse_file
         self.validated_file = validated_file
         ensure_json_file(self.pending_file, default_value=[])
         ensure_json_file(self.inverse_file, default_value=[])
@@ -1052,17 +1038,12 @@ class QueueManager:
         q.append(trade)
         self.save_queue(self.inverse_file, q)
 
-    def add_validated(self, trade: Dict[str, Any]) -> None:
-        q = self.load_queue(self.validated_file)
-        q.append(trade)
-        self.save_queue(self.validated_file, q)
-
 
 # -------------------- Streamlit UI --------------------
 
-st.set_page_config(page_title="v3.2 Options Flow Scanner", layout="wide")
-st.title("v3.2 Options Flow Scanner (Replay + Underlying IV 7D)")
-st.caption("UW + Polygon • (optional EODHD contract IV) • Local IV store • Underlying ATM IV + 7D")
+st.set_page_config(page_title="v3.3 Options Flow Scanner", layout="wide")
+st.title("v3.3 Options Flow Scanner (Replay + IV from EODHD)")
+st.caption("UW + Polygon (spot/SR) • EODHD (contract IV + underlying ATM IV) • Local IV store + 7D")
 
 snapshot = SnapshotManager(SNAPSHOT_FILE)
 iv_store = LocalIVStore(IV_STORE_FILE)
@@ -1078,14 +1059,14 @@ with st.sidebar:
         st.write("Snapshot saved: —")
 
     st.divider()
-    st.header("API Keys (Secrets recommended)")
+    st.header("API Keys")
     uw_token = st.text_input("Unusual Whales Token", value=os.getenv("UW_TOKEN", ""), type="password")
     polygon_key = st.text_input("Polygon API Key", value=os.getenv("POLYGON_API_KEY", ""), type="password")
     eodhd_key = st.text_input("EODHD API Key", value=os.getenv("EODHD_API_KEY", ""), type="password")
 
     st.divider()
     st.subheader("Snapshot Tools")
-    uploaded = st.file_uploader("Upload snapshot JSON (optional)", type=["json"])
+    uploaded = st.file_uploader("Upload snapshot JSON", type=["json"])
     if uploaded is not None:
         try:
             up = json.loads(uploaded.read().decode("utf-8"))
@@ -1111,7 +1092,6 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Local IV Store")
-    st.caption("Contract IV and Underlying IV are stored here.")
     st.download_button(
         "Download IV store",
         data=iv_store.raw_text(),
@@ -1128,23 +1108,22 @@ with st.sidebar:
     iv_lookback_days = st.slider("Ramp lookback days", 3, 10, 3, 1)
     iv_strict = st.checkbox("Require strictly increasing IV", value=True)
 
-    st.markdown("**Underlying ATM IV Window (Polygon)**")
+    st.markdown("**Underlying ATM IV Window (EODHD)**")
     u_dte_min = st.slider("Underlying IV min DTE", 3, 30, 7, 1)
-    u_dte_max = st.slider("Underlying IV max DTE", 7, 60, 30, 1)
+    u_dte_max = st.slider("Underlying IV max DTE", 7, 90, 30, 1)
 
     st.divider()
     st.subheader("Scan Controls")
-    use_iv_contract = st.checkbox("Use contract IV (EODHD chain) + store locally", value=True)
-    use_iv_underlying = st.checkbox("Use underlying ATM IV (Polygon) + store 7D locally", value=True)
-
-    limit = st.slider("UW flow alerts limit (Live only)", min_value=10, max_value=250, value=200, step=10)
+    use_iv_contract = st.checkbox("Use contract IV (EODHD) + store", value=True)
+    use_iv_underlying = st.checkbox("Use underlying ATM IV (EODHD) + store 7D", value=True)
+    limit = st.slider("UW flow alerts limit (Live only)", 10, 250, 200, 10)
 
     min_premium = st.number_input("Min premium ($)", min_value=0, value=25_000, step=5_000)
     min_size = st.number_input("Min size (contracts)", min_value=0, value=0, step=100)
     min_vol_oi = st.number_input("Min Vol/OI", min_value=0.0, value=1.0, step=0.1)
 
     require_vol_gt_oi = st.checkbox("Require Vol > OI", value=False)
-    exclude_indices = st.checkbox("Exclude indices + major ETFs (SPX/SPY/QQQ/etc.)", value=True)
+    exclude_indices = st.checkbox("Exclude indices + major ETFs", value=True)
 
     st.divider()
     st.subheader("Ladder Settings")
@@ -1157,7 +1136,7 @@ with st.sidebar:
     inverse_path = st.text_input("Inverse file", value=INVERSE_SIGNALS_FILE)
     validated_path = st.text_input("Validated file", value=VALIDATED_TRADES_FILE)
 
-# Instantiate clients
+# Instantiate
 uw = UnusualWhalesAPI(uw_token)
 polygon = PolygonAPI(polygon_key)
 eodhd = EODHDAPI(eodhd_key)
@@ -1172,11 +1151,12 @@ enricher = DataEnricher(
     underlying_iv_dte_min=int(u_dte_min),
     underlying_iv_dte_max=int(u_dte_max),
 )
-scorer = V32ScoringEngine()
+
+scorer = V33ScoringEngine()
 ladder = LadderDetector(uw)
 queue = QueueManager(pending_path, inverse_path, validated_path)
 
-tabs = st.tabs(["Scan", "Manual Score", "Queues", "Connections"])
+tabs = st.tabs(["Scan", "Debug IV", "Connections"])
 
 
 def get_source_flows() -> Tuple[List[Dict[str, Any]], str]:
@@ -1198,10 +1178,8 @@ with tabs[0]:
             """
 - Pulls UW flows (Live or Snapshot)
 - Filters: min premium + exclusions + min size + min vol/oi (+ optional vol>OI)
-- Enriches: Polygon spot + S/R + wick + (optional) EODHD contract IV
-- NEW: Polygon Underlying ATM IV stored daily + 7D history
-- Scores v3.2 and writes queues:
-  - pending (score >= 5), inverse (score <= -3)
+- Enriches: Polygon spot + S/R + wick
+- IV: EODHD contract IV + EODHD underlying ATM IV stored daily + 7D history
 """
         )
 
@@ -1272,8 +1250,8 @@ with tabs[0]:
 
                         enriched = enricher.enrich_trade(
                             f,
-                            use_iv=bool(use_iv_contract and eodhd_key),
-                            use_underlying_iv=bool(use_iv_underlying and polygon_key),
+                            use_contract_iv=bool(use_iv_contract and eodhd_key),
+                            use_underlying_iv=bool(use_iv_underlying and eodhd_key),
                         )
 
                         is_ladder, related = ladder.detect(
@@ -1316,7 +1294,6 @@ with tabs[0]:
                                 "Spot": round(safe_float(r.get("spot", 0.0)), 2),
                                 "Dist%": round(safe_float(r.get("strike_dist_pct", 0.0)), 2),
                                 "Premium$": round(safe_float(r.get("total_premium", 0.0))),
-                                "Prem%": round(safe_float(r.get("premium_pct", 0.0)), 2),
                                 "Ask%": round(safe_float(r.get("ask_pct", 0.0)), 1),
                                 "Vol/OI": round(safe_float(r.get("vol_oi_ratio", 0.0)), 2),
                                 "IV(Contract)%": round(safe_float(r.get("current_iv", 0.0)), 2),
@@ -1334,193 +1311,57 @@ with tabs[0]:
                     st.dataframe(table, use_container_width=True, hide_index=True)
 
                     st.divider()
-                    st.subheader("Details")
-                    for r in results[:60]:
+                    st.subheader("Details (Top 50)")
+                    for r in results[:50]:
                         header = (
                             f"{r['ticker']} {str(r['option_type']).upper()} ${r['strike']} {r['expiry']} • "
                             f"Score {r['predictive_score']}/{r['max_score']} • {r['verdict']}"
                         )
                         with st.expander(header, expanded=False):
-                            c1, c2, c3 = st.columns(3)
-                            with c1:
-                                st.write("**Entry (CT)**", r.get("entry_timestamp"))
-                                st.write("**Spot**", round(safe_float(r.get("spot", 0)), 2))
-                                st.write("**Spot Source**", r.get("spot_source"))
-                                st.write("**DTE**", r.get("dte"))
-                                st.write("**Contract Key**", r.get("contract_key"))
-                                st.write("**Underlying IV Key**", r.get("underlying_iv_key"))
-                            with c2:
-                                st.write("**Premium**", pretty_money(safe_float(r.get("total_premium", 0))))
-                                st.write("**Prem %**", f"{safe_float(r.get('premium_pct', 0)):.2f}%")
-                                st.write("**Ask %**", f"{safe_float(r.get('ask_pct', 0)):.1f}%")
-                                st.write("**Vol/OI**", f"{safe_float(r.get('vol_oi_ratio', 0)):.2f}x")
-                                st.write("**Sweep**", bool(r.get("has_sweep", False)))
-                            with c3:
-                                st.write("**IV (contract)**", f"{safe_float(r.get('current_iv', 0)):.2f}%")
-                                st.write("**IV (underlying ATM)**", f"{safe_float(r.get('iv_underlying_current', 0)):.2f}%")
-                                st.write("**IV (underlying source)**", r.get("iv_underlying_source"))
-                                st.write("**IV 7d change**", f"{safe_float(r.get('iv_underlying_7d_change', 0)):.2f}")
-                                st.write("**Underlying IV Ramp**", bool(r.get("iv_underlying_ramping", False)))
-                                st.write("**Underlying Ramp Pts**", r.get("iv_underlying_ramp_points"))
-                                st.write("**Earnings (days)**", r.get("days_to_earnings"))
-                                st.write("**Ladder**", r.get("ladder_role", "isolated"))
-                                if r.get("related_strikes"):
-                                    st.write("**Related strikes**", r.get("related_strikes"))
-
-                            st.write("**Factors**")
-                            st.write("\n".join([f"• {x}" for x in r.get("score_factors", [])]) or "—")
-                            st.write("**Penalties**")
-                            st.write("\n".join([f"• {x}" for x in r.get("score_penalties", [])]) or "—")
-
+                            st.write("**Underlying IV source**:", r.get("iv_underlying_source"))
                             st.write("**Underlying IV 7D points (date, iv%)**")
                             st.json(r.get("iv_underlying_points_7d", []))
-
-                            st.write("**Contract IV history (date -> IV%)**")
+                            st.write("**Underlying IV debug**")
+                            st.json(r.get("iv_underlying_debug", {}))
+                            st.write("**Contract IV history (date -> iv%)**")
                             st.json(r.get("iv_history_local", {}))
 
-                            st.write("**Raw UW (debug)**")
-                            st.json(r.get("_raw", {}))
 
-
-# -------------------- Manual Score --------------------
+# -------------------- Debug IV --------------------
 with tabs[1]:
-    st.subheader("Manual Score (paste one trade JSON)")
+    st.subheader("Debug IV (why you see 0)")
+    tkr = st.text_input("Ticker to debug", value="AAPL")
+    dmin = st.number_input("DTE min", min_value=1, value=int(u_dte_min), step=1)
+    dmax = st.number_input("DTE max", min_value=1, value=int(u_dte_max), step=1)
 
-    sample = {
-        "ticker": "AAPL",
-        "strike": 200,
-        "option_type": "call",
-        "expiry": (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d"),
-        "start_time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "total_size": 5000,
-        "open_interest": 1000,
-        "total_ask_side_prem": 1_200_000,
-        "total_bid_side_prem": 0,
-        "total_mid_side_prem": 0,
-        "total_no_side_prem": 0,
-        "is_sweep": True,
-    }
+    if st.button("Run IV debug", type="primary"):
+        spot, spot_src = polygon.get_spot_at_time(tkr.upper(), to_central_time(datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")))
+        st.write("Spot:", spot, "| source:", spot_src)
 
-    raw_text = st.text_area("Trade JSON", value=json.dumps(sample, indent=2), height=260)
-    do_enrich = st.checkbox("Enrich using APIs", value=True)
-    do_ladder = st.checkbox("Run ladder detection", value=False)
-    do_iv_contract = st.checkbox("Use contract IV (EODHD)", value=True)
-    do_iv_underlying = st.checkbox("Use underlying IV (Polygon)", value=True)
+        iv_u, src_u, dbg = eodhd.get_underlying_atm_iv(tkr.upper(), spot, int(dmin), int(dmax))
+        st.write("Underlying ATM IV (%):", iv_u)
+        st.write("Source:", src_u)
+        st.json(dbg)
 
-    if st.button("Score this trade", type="primary"):
-        try:
-            raw_flow = json.loads(raw_text)
-            if not isinstance(raw_flow, dict):
-                raise ValueError("JSON must be an object")
-
-            if do_enrich:
-                enriched = enricher.enrich_trade(
-                    raw_flow,
-                    use_iv=bool(do_iv_contract and eodhd_key),
-                    use_underlying_iv=bool(do_iv_underlying and polygon_key),
-                )
-
-                if do_ladder:
-                    is_l, rel = ladder.detect(
-                        ticker=enriched["ticker"],
-                        target_strike=enriched["strike"],
-                        option_type=enriched["option_type"],
-                        expiry=enriched["expiry"],
-                        recent_minutes=int(ladder_minutes),
-                        min_unique_strikes=int(ladder_min_strikes),
-                    )
-                    if is_l:
-                        enriched["ladder_role"] = "ladder"
-                        enriched["related_strikes"] = rel
-
-                scored = scorer.score(enriched)
-                st.success(f"Score: {scored['predictive_score']} / max {scored['max_score']} • {scored['verdict']}")
-                st.json(scored)
-            else:
-                scored = scorer.score(raw_flow)
-                st.json(scored)
-
-        except Exception as e:
-            st.error(f"Error: {e}")
-
-
-# -------------------- Queues --------------------
-with tabs[2]:
-    st.subheader("Queues")
-    c1, c2, c3 = st.columns(3)
-
-    with c1:
-        st.write("### Pending")
-        pend = queue.load_queue(pending_path)
-        st.write(f"{len(pend)} items")
-        st.dataframe(
-            [{"Ticker": t.get("ticker"), "Type": t.get("option_type"), "Strike": t.get("strike"),
-              "Expiry": t.get("expiry"), "Score": t.get("predictive_score"), "Verdict": t.get("verdict")}
-             for t in pend[-200:]],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    with c2:
-        st.write("### Inverse")
-        inv = queue.load_queue(inverse_path)
-        st.write(f"{len(inv)} items")
-        st.dataframe(
-            [{"Ticker": t.get("ticker"), "Type": t.get("option_type"), "Strike": t.get("strike"),
-              "Expiry": t.get("expiry"), "Score": t.get("predictive_score"), "Verdict": t.get("verdict")}
-             for t in inv[-200:]],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    with c3:
-        st.write("### Validated")
-        val = queue.load_queue(validated_path)
-        st.write(f"{len(val)} items")
-        st.dataframe(
-            [{"Ticker": t.get("ticker"), "Type": t.get("option_type"), "Strike": t.get("strike"),
-              "Expiry": t.get("expiry"), "Pred": t.get("predictive_score"),
-              "Val": t.get("validated_score"), "Val Verdict": t.get("validated_verdict")}
-             for t in val[-200:]],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    st.divider()
-    if st.button("Reset all queues (danger)", type="secondary"):
-        queue.save_queue(pending_path, [])
-        queue.save_queue(inverse_path, [])
-        queue.save_queue(validated_path, [])
-        st.warning("Queues cleared.")
+        st.caption("If iv_call and iv_put are 0, EODHD is not returning impliedVolatility for that ticker/expiry.")
 
 
 # -------------------- Connections --------------------
-with tabs[3]:
+with tabs[2]:
     st.subheader("Test Connections")
-    col1, col2, col3 = st.columns(3)
+    c1, c2, c3 = st.columns(3)
 
-    with col1:
+    with c1:
         if st.button("Test UW"):
             ok, msg = uw.test_connection()
             st.success(msg) if ok else st.error(msg)
 
-    with col2:
+    with c2:
         if st.button("Test Polygon"):
             ok, msg = polygon.test_connection()
             st.success(msg) if ok else st.error(msg)
 
-    with col3:
+    with c3:
         if st.button("Test EODHD"):
             ok, msg = eodhd.test_connection()
             st.success(msg) if ok else st.error(msg)
-
-    st.divider()
-    st.markdown(
-        """
-**Underlying IV 7D**
-- Each scan computes ATM IV using Polygon option snapshot:
-  `/v3/snapshot/options/{underlying}/{option_contract}`
-- Stores 1 value per day under: `TICKER|UNDERLYING_IV`
-- Table shows Underlying IV, 7d delta, and ramp flag.
-"""
-    )
