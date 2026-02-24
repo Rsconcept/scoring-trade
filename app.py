@@ -2,24 +2,24 @@
 """
 Streamlit v3.2 Options Flow Scanner (Replay Mode + Local IV History + Polygon ATM IV 7D)
 ======================================================================================
-What’s new (requested):
-- Adds CLEAN IV for the UNDERLYING (ticker) using Polygon options chain:
-  - Current ATM IV (nearest expiry inside target DTE window)
-  - Past 7 trading days ATM IV series (stored locally in JSON)
-- Keeps your existing EODHD per-contract chain IV (optional)
-- Uses the SAME local JSON store (iv_history_store.json)
-  - Contract keys stay the same
-  - New ticker-level keys added:  "TICKER|UNDERLYING_IV"
-- Adds scoring signals:
-  - Underlying IV Ramp (local, strict)
-  - Underlying IV 7D change
+Fix included:
+- Correct Polygon option snapshot endpoint:
+    /v3/snapshot/options/{underlying}/{option_contract}
+  (the previous version used the wrong path, causing Underlying IV to stay 0)
 
-Notes:
-- Streamlit Community Cloud has an ephemeral filesystem (files can reset on redeploy).
-  Replay snapshots + IV store are best-effort.
+What it does:
+- UW flows (live or replay snapshot)
+- Polygon spot + S/R
+- Optional: EODHD per-contract IV
+- NEW: Polygon Underlying ATM IV (nearest expiry within a DTE window) + store daily
+- Local JSON store builds 7-day IV history + ramp detection
 
 Secrets:
 UW_TOKEN, POLYGON_API_KEY, EODHD_API_KEY
+
+requirements.txt:
+streamlit
+requests
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ import json
 import os
 from datetime import datetime, timedelta, timezone, date
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import requests
 import streamlit as st
@@ -163,7 +164,6 @@ def contract_key(ticker: str, expiry: str, option_type: str, strike: float) -> s
 
 
 def underlying_iv_key(ticker: str) -> str:
-    """Key to store ticker-level (underlying) ATM IV series."""
     return f"{ticker.upper()}|UNDERLYING_IV"
 
 
@@ -237,7 +237,6 @@ class LocalIVStore:
         if not isinstance(rows, list):
             rows = []
 
-        # If date exists, replace; else append
         replaced = False
         for r in rows:
             if isinstance(r, dict) and r.get("date") == date_yyyy_mm_dd:
@@ -249,7 +248,7 @@ class LocalIVStore:
 
         rows = [r for r in rows if isinstance(r, dict) and r.get("date") and r.get("iv") is not None]
         rows.sort(key=lambda r: r["date"])
-        rows = rows[-120:]  # keep more for safety
+        rows = rows[-120:]
 
         data[key] = rows
         self.save_all(data)
@@ -470,12 +469,6 @@ class PolygonAPI:
 
     # ---------- NEW: Polygon ATM IV (Underlying) ----------
 
-    def _polygon_date(self, dt: date) -> str:
-        return dt.strftime("%Y-%m-%d")
-
-    def _to_yyyymmdd(self, yyyy_mm_dd: str) -> str:
-        return yyyy_mm_dd.replace("-", "")
-
     def _closest_strike(self, strikes: List[float], spot: float) -> Optional[float]:
         if not strikes or spot <= 0:
             return None
@@ -483,7 +476,6 @@ class PolygonAPI:
 
     def _contract_ticker_polygon_format(self, underlying: str, expiry: str, option_type: str, strike: float) -> str:
         # Polygon contract ticker format: O:{UNDERLYING}{YYMMDD}{C/P}{strike*1000 padded to 8}
-        # Example: O:AAPL240621C00200000
         underlying = underlying.upper().strip()
         option_type = option_type.lower().strip()
         yy = expiry[2:4]
@@ -494,29 +486,42 @@ class PolygonAPI:
         strike_str = f"{strike_int:08d}"
         return f"O:{underlying}{yy}{mm}{dd}{cp}{strike_str}"
 
-    def _get_contract_snapshot_iv(self, contract_ticker: str) -> float:
-        # Try Polygon snapshot for option contract (contains implied volatility in many plans)
-        url = f"{self.BASE_URL}/v3/snapshot/options/{contract_ticker}"
-        status, data, _ = http_get(url, params={"apiKey": self.api_key})
-        if status != 200 or not data:
+    def _get_contract_snapshot_iv(self, underlying: str, option_contract: str) -> float:
+        """
+        FIX: Correct Polygon endpoint is:
+          /v3/snapshot/options/{underlying}/{option_contract}
+
+        NOTE: option_contract contains ":" -> must be URL-encoded for path.
+        """
+        underlying = underlying.upper().strip()
+        option_contract = option_contract.strip()
+        if not underlying or not option_contract:
             return 0.0
 
-        # Polygon responses vary by plan; try common places
-        # We keep it defensive.
+        oc = quote(option_contract, safe="")  # encode ":" and other unsafe chars in path segment
+        url = f"{self.BASE_URL}/v3/snapshot/options/{underlying}/{oc}"
+
+        status, data, _ = http_get(url, params={"apiKey": self.api_key})
+        if status != 200 or not data or not isinstance(data, dict):
+            return 0.0
+
         try:
-            res = data.get("results") if isinstance(data, dict) else None
+            res = data.get("results")
             if not isinstance(res, dict):
                 return 0.0
+
             greeks = res.get("greeks") or {}
             iv = safe_float(greeks.get("iv", 0.0))  # often fraction (0.25)
+
             if iv > 0:
                 return iv * 100.0 if iv < 1 else iv
-            # fallback if they use "implied_volatility"
+
             iv2 = safe_float(res.get("implied_volatility", 0.0))
             if iv2 > 0:
                 return iv2 * 100.0 if iv2 < 1 else iv2
         except Exception:
-            pass
+            return 0.0
+
         return 0.0
 
     def get_underlying_atm_iv_today(
@@ -530,17 +535,14 @@ class PolygonAPI:
         """
         Compute a CLEAN "ATM IV" for the underlying:
         - Find expirations in [dte_min, dte_max]
-        - Choose the nearest expiry (or best fit)
+        - Choose the nearest expiry
         - Choose closest strike to spot
         - Pull contract snapshot IV via Polygon
-        Returns (iv_percent, debug_source_string)
         """
         ticker = ticker.strip().upper()
         if not self.api_key or spot <= 0:
             return 0.0, "Polygon IV: missing key or spot"
 
-        # Get contracts list (calls) to discover strikes/expirations
-        # We’ll pull a limited set and then select.
         url = f"{self.BASE_URL}/v3/reference/options/contracts"
         params = {
             "apiKey": self.api_key,
@@ -557,7 +559,6 @@ class PolygonAPI:
         if not isinstance(results, list) or not results:
             return 0.0, "Polygon IV: no contracts"
 
-        # Filter expirations in DTE window
         exp_to_strikes: Dict[str, List[float]] = {}
         for c in results:
             if not isinstance(c, dict):
@@ -584,29 +585,18 @@ class PolygonAPI:
         if atm_strike is None:
             return 0.0, "Polygon IV: no strikes"
 
-        # Use CALL contract snapshot IV as the proxy (stable & widely used)
-        contract_ticker = self._contract_ticker_polygon_format(ticker, chosen_expiry, "call", atm_strike)
-        iv_pct = self._get_contract_snapshot_iv(contract_ticker)
-        if iv_pct <= 0:
-            # fallback to PUT if CALL snapshot lacks greeks
-            contract_ticker2 = self._contract_ticker_polygon_format(ticker, chosen_expiry, "put", atm_strike)
-            iv_pct2 = self._get_contract_snapshot_iv(contract_ticker2)
-            if iv_pct2 > 0:
-                return iv_pct2, f"Polygon ATM IV PUT {chosen_expiry} strike {atm_strike}"
-            return 0.0, f"Polygon IV snapshot missing (plan/endpoint) {chosen_expiry} strike {atm_strike}"
+        # CALL snapshot first; PUT fallback
+        call_contract = self._contract_ticker_polygon_format(ticker, chosen_expiry, "call", atm_strike)
+        iv_pct = self._get_contract_snapshot_iv(ticker, call_contract)
+        if iv_pct > 0:
+            return iv_pct, f"Polygon ATM IV CALL {chosen_expiry} strike {atm_strike}"
 
-        return iv_pct, f"Polygon ATM IV CALL {chosen_expiry} strike {atm_strike}"
+        put_contract = self._contract_ticker_polygon_format(ticker, chosen_expiry, "put", atm_strike)
+        iv_pct2 = self._get_contract_snapshot_iv(ticker, put_contract)
+        if iv_pct2 > 0:
+            return iv_pct2, f"Polygon ATM IV PUT {chosen_expiry} strike {atm_strike}"
 
-    def get_last_n_trading_days(self, n: int = 7) -> List[str]:
-        # Simple approximation: last n calendar days filtered by weekday.
-        # For your 7-day IV we store daily points; missing days are okay.
-        out = []
-        d = date.today()
-        while len(out) < n + 4 and len(out) < 30:
-            if d.weekday() < 5:
-                out.append(d.strftime("%Y-%m-%d"))
-            d = d - timedelta(days=1)
-        return sorted(out)[-n:]
+        return 0.0, f"Polygon IV snapshot missing (plan/endpoint) {chosen_expiry} strike {atm_strike}"
 
 
 class EODHDAPI:
@@ -746,10 +736,11 @@ class DataEnricher:
                     except Exception:
                         continue
 
-        # Contract key (per-trade contract)
+        # Keys
         ckey = contract_key(ticker, expiry, option_type, strike)
+        ukey = underlying_iv_key(ticker)
 
-        # ---- Existing: EODHD per-contract IV ----
+        # ---- Contract IV (EODHD) ----
         current_iv_contract = 0.0
         if use_iv and self.eodhd.api_key:
             current_iv_contract = self.eodhd.get_iv_from_chain(ticker, strike, expiry, option_type)
@@ -761,11 +752,9 @@ class DataEnricher:
             ckey, lookback_days=self.iv_lookback_days, require_strict=self.iv_require_strict
         )
 
-        # ---- NEW: Polygon ATM IV for underlying + 7D history ----
+        # ---- Underlying ATM IV (Polygon) ----
         underlying_iv_current = 0.0
         underlying_iv_source = ""
-        ukey = underlying_iv_key(ticker)
-
         if use_underlying_iv and self.polygon.api_key and spot > 0:
             underlying_iv_current, underlying_iv_source = self.polygon.get_underlying_atm_iv_today(
                 ticker=ticker,
@@ -785,7 +774,6 @@ class DataEnricher:
         if len(underlying_iv_points_7d) >= 2:
             iv_7d_change = float(underlying_iv_points_7d[-1][1] - underlying_iv_points_7d[0][1])
 
-        # Clean exception
         clean_exception = (
             ask_pct >= 70 and vol_oi_ratio > 1 and strike_dist_pct <= 7 and 2.5 <= premium_pct <= 5.0
         )
@@ -811,14 +799,14 @@ class DataEnricher:
             "support": safe_float(sr_data.get("support", 0)),
             "resistance": safe_float(sr_data.get("resistance", 0)),
 
-            # Contract IV fields (old)
+            # Contract IV
             "contract_key": ckey,
             "current_iv": float(current_iv_contract),
             "iv_history_local": contract_iv_history,
             "iv_ramping": bool(contract_iv_ramping),
             "iv_ramp_points": contract_ramp_points,
 
-            # Underlying IV fields (new)
+            # Underlying IV
             "underlying_iv_key": ukey,
             "iv_underlying_current": float(underlying_iv_current),
             "iv_underlying_source": underlying_iv_source,
@@ -890,7 +878,6 @@ class V32ScoringEngine:
         penalties: List[str] = []
         record["category_tags"] = record.get("category_tags") or []
 
-        # Premium % heuristic
         prem_pct = safe_float(record.get("premium_pct", 0))
         if 2.5 <= prem_pct <= 5.0:
             score += 2
@@ -904,7 +891,6 @@ class V32ScoringEngine:
         else:
             factors.append(f"Excessive premium {prem_pct:.1f}% (0)")
 
-        # Strike distance
         dist = safe_float(record.get("strike_dist_pct", 0))
         if dist <= 7:
             score += 2
@@ -915,7 +901,6 @@ class V32ScoringEngine:
             score -= 2
             penalties.append(f"Strike {dist:.1f}% deep OTM (-2)")
 
-        # DTE
         dte = safe_int(record.get("dte", 0))
         if 7 <= dte <= 21:
             score += 1
@@ -924,7 +909,6 @@ class V32ScoringEngine:
             score -= 1
             penalties.append("0-1 DTE (-1)")
 
-        # Execution side
         ask_pct = safe_float(record.get("ask_pct", 0))
         if ask_pct >= 70:
             score += 1
@@ -935,7 +919,6 @@ class V32ScoringEngine:
         else:
             factors.append("Execution side unknown/neutral (0)")
 
-        # Volume vs OI
         vol_oi = safe_float(record.get("vol_oi_ratio", 0))
         if vol_oi >= 2:
             score += 2
@@ -944,24 +927,20 @@ class V32ScoringEngine:
             score += 1
             factors.append(f"Vol/OI {vol_oi:.1f}x (+1)")
 
-        # Wick rule
         if bool(record.get("wick_triggered", False)):
             score -= 2
             penalties.append("Wick reversal strike (-2)")
 
-        # IV ramp (UNDERLYING preferred)
         iv_under_ramp = bool(record.get("iv_underlying_ramping", False))
         if iv_under_ramp:
             score += 1
             factors.append(f"Underlying IV ramp (+1) {record.get('iv_underlying_ramp_points')}")
         else:
-            # fallback to contract ramp
             iv_contract_ramp = bool(record.get("iv_ramping", False))
             if iv_contract_ramp:
                 score += 1
                 factors.append(f"Contract IV ramp (+1) {record.get('iv_ramp_points')}")
 
-        # Underlying IV 7D change
         iv7 = safe_float(record.get("iv_underlying_7d_change", 0.0))
         if iv7 >= 3.0:
             score += 1
@@ -970,7 +949,6 @@ class V32ScoringEngine:
             score -= 1
             penalties.append(f"Underlying IV {iv7:.1f} in 7d (-1)")
 
-        # Ladder/cluster
         ladder_role = str(record.get("ladder_role", "isolated")).lower()
         if ladder_role in ("anchor", "specleg", "ladder"):
             score += 1
@@ -979,7 +957,6 @@ class V32ScoringEngine:
             score -= 1
             penalties.append("Isolated (-1)")
 
-        # Support penalty for puts
         if str(record.get("option_type", "")).lower() == "put":
             strike = safe_float(record.get("strike", 0))
             support = safe_float(record.get("support", 0))
@@ -987,13 +964,11 @@ class V32ScoringEngine:
                 score -= 1
                 penalties.append("Put above support (-1)")
 
-        # Catalyst bonus (2–10 days)
         days_to_er = record.get("days_to_earnings")
         if isinstance(days_to_er, int) and 2 <= days_to_er <= 10:
             score += 1
             factors.append(f"Catalyst {days_to_er}d (+1)")
 
-        # Cap logic (unlocks if IV ramp true)
         if iv_under_ramp or bool(record.get("iv_ramping", False)):
             max_score = 12
         elif bool(record.get("clean_exception", False)):
@@ -1045,6 +1020,7 @@ class QueueManager:
     def __init__(self, pending_file: str, inverse_file: str, validated_file: str):
         self.pending_file = pending_file
         self.inverse_file = inverse_file
+        self.validated_file = inverse_file
         self.validated_file = validated_file
         ensure_json_file(self.pending_file, default_value=[])
         ensure_json_file(self.inverse_file, default_value=[])
@@ -1136,14 +1112,13 @@ with st.sidebar:
     st.divider()
     st.subheader("Local IV Store")
     st.caption("Contract IV and Underlying IV are stored here.")
-    if st.button("Download IV store", use_container_width=True):
-        st.download_button(
-            "Click to download iv_history_store.json",
-            data=iv_store.raw_text(),
-            file_name="iv_history_store.json",
-            mime="application/json",
-            use_container_width=True,
-        )
+    st.download_button(
+        "Download IV store",
+        data=iv_store.raw_text(),
+        file_name="iv_history_store.json",
+        mime="application/json",
+        use_container_width=True,
+    )
     if st.button("Reset IV store (danger)", type="secondary", use_container_width=True):
         iv_store.reset()
         st.warning("IV store reset.")
@@ -1182,7 +1157,7 @@ with st.sidebar:
     inverse_path = st.text_input("Inverse file", value=INVERSE_SIGNALS_FILE)
     validated_path = st.text_input("Validated file", value=VALIDATED_TRADES_FILE)
 
-# Instantiate
+# Instantiate clients
 uw = UnusualWhalesAPI(uw_token)
 polygon = PolygonAPI(polygon_key)
 eodhd = EODHDAPI(eodhd_key)
@@ -1201,7 +1176,7 @@ scorer = V32ScoringEngine()
 ladder = LadderDetector(uw)
 queue = QueueManager(pending_path, inverse_path, validated_path)
 
-tabs = st.tabs(["Scan", "Manual Score", "Validate T+1", "Queues", "Connections"])
+tabs = st.tabs(["Scan", "Manual Score", "Queues", "Connections"])
 
 
 def get_source_flows() -> Tuple[List[Dict[str, Any]], str]:
@@ -1427,7 +1402,6 @@ with tabs[1]:
     }
 
     raw_text = st.text_area("Trade JSON", value=json.dumps(sample, indent=2), height=260)
-
     do_enrich = st.checkbox("Enrich using APIs", value=True)
     do_ladder = st.checkbox("Run ladder detection", value=False)
     do_iv_contract = st.checkbox("Use contract IV (EODHD)", value=True)
@@ -1470,14 +1444,8 @@ with tabs[1]:
             st.error(f"Error: {e}")
 
 
-# -------------------- Validate T+1 --------------------
-with tabs[2]:
-    st.subheader("Validate T+1 (manual inputs)")
-    st.info("Unchanged from your version (kept for compatibility).")
-
-
 # -------------------- Queues --------------------
-with tabs[3]:
+with tabs[2]:
     st.subheader("Queues")
     c1, c2, c3 = st.columns(3)
 
@@ -1527,7 +1495,7 @@ with tabs[3]:
 
 
 # -------------------- Connections --------------------
-with tabs[4]:
+with tabs[3]:
     st.subheader("Test Connections")
     col1, col2, col3 = st.columns(3)
 
@@ -1549,12 +1517,10 @@ with tabs[4]:
     st.divider()
     st.markdown(
         """
-**How Underlying IV 7D works**
-- Each scan, for each ticker, we compute **ATM IV** using Polygon (expiry within your DTE window).
-- We store 1 value per day under: `TICKER|UNDERLYING_IV`
-- Your table shows:
-  - IV(Underlying)%  = today’s ATM IV
-  - IV7dΔ = change between oldest and newest stored points in last 7 entries
-  - IVRamp(U) = strictly increasing ramp over your ramp lookback
+**Underlying IV 7D**
+- Each scan computes ATM IV using Polygon option snapshot:
+  `/v3/snapshot/options/{underlying}/{option_contract}`
+- Stores 1 value per day under: `TICKER|UNDERLYING_IV`
+- Table shows Underlying IV, 7d delta, and ramp flag.
 """
     )
