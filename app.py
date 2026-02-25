@@ -1,27 +1,29 @@
 #!/usr/bin/env python3
 """
-Streamlit v3.7 Options Flow Scanner — FIXED IV (UW iv_start/iv_end) + Underlying IV 7D
-=====================================================================================
-Fixes (based on your USO raw UW example):
-✅ Reads UW IV fields: iv_start / iv_end (0.xx -> percent)
-✅ Reads UW option type field: type (call/put)
-✅ Reads UW start_time in epoch ms (not ISO)
-✅ Uses UW option_chain as stable contract id when available
-✅ Builds "Underlying ATM IV" per ticker during scan:
-   - Picks the BEST (closest-to-ATM) contract IV found for that ticker in this scan
-   - Stores it daily in iv_history_store.json (7D history works)
+Streamlit v3.8 Options Flow Scanner — FIXED IV + Underlying IV Always Shows
+==========================================================================
+Fixes / Upgrades:
+✅ Contract IV: reads UW iv_start / iv_end (0.xx -> percent)
+✅ UW field mapping: "type" -> option_type, "start_time" epoch ms -> CT
+✅ Spot: prefers UW underlying_price, falls back to EODHD real-time close
+✅ Underlying ATM IV:
+   - For each ticker in the scan, finds the BEST ATM-ish contract IV (closest-to-ATM)
+   - Stores it daily as ticker-level underlying IV in iv_history_store.json
+   - Then assigns that underlying IV to ALL rows of that ticker (so the table always shows it)
+   - If no ATM-ish trade exists today, falls back to last stored underlying IV
+✅ 7D change uses local store points (no external history endpoints)
 
-Your requested defaults included:
+Your requested defaults:
 ✅ Min premium default = 1,000,000
 ✅ Require Vol > OI default = ON
-✅ Optional manual ticker scan entry
+✅ Manual ticker scan input (optional)
 
 requirements.txt:
 streamlit
 requests
 
-Secrets supported:
-UW_TOKEN, POLYGON_API_KEY, EODHD_API_KEY
+Secrets:
+UW_TOKEN, EODHD_API_KEY
 """
 
 from __future__ import annotations
@@ -52,14 +54,12 @@ EXCLUDED_TICKERS_DEFAULT = {
     "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLC",
 }
 
-
 # -------------------- Helpers --------------------
 
 def safe_float(x: Any, default: float = 0.0) -> float:
     try:
         if x is None:
             return default
-        # strings like "0.5972" ok
         return float(x)
     except Exception:
         return default
@@ -134,19 +134,13 @@ def calculate_dte(expiry_yyyy_mm_dd: str) -> int:
 
 
 def normalize_iv_pct(iv: float) -> float:
-    """
-    Accepts either fraction (0.59) or percent (59).
-    Returns percent.
-    """
+    """Accepts fraction (0.59) or percent (59). Returns percent."""
     if iv <= 0:
         return 0.0
     return iv * 100.0 if iv < 1.0 else iv
 
 
 def uw_epoch_ms_to_ct_string(epoch_ms: Any) -> str:
-    """
-    UW sometimes provides start_time as epoch milliseconds.
-    """
     try:
         ms = int(epoch_ms)
         dt_utc = datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
@@ -157,21 +151,12 @@ def uw_epoch_ms_to_ct_string(epoch_ms: Any) -> str:
 
 
 def to_ct_string(any_time: Any) -> str:
-    """
-    Accepts ISO string or epoch ms and returns CT string.
-    """
     if any_time is None:
         return ""
-    # epoch ms
     if isinstance(any_time, (int, float)) and any_time > 1_000_000_000:
         return uw_epoch_ms_to_ct_string(any_time)
-    # numeric in string
     if isinstance(any_time, str) and any_time.isdigit():
-        try:
-            return uw_epoch_ms_to_ct_string(int(any_time))
-        except Exception:
-            pass
-    # ISO
+        return uw_epoch_ms_to_ct_string(any_time)
     try:
         s = str(any_time)
         if "T" in s:
@@ -194,13 +179,10 @@ def underlying_iv_key(ticker: str) -> str:
 
 
 def extract_uw_iv(raw_flow: Dict[str, Any]) -> float:
-    """
-    FIX: handle UW iv_start / iv_end directly (your USO example).
-    """
+    """FIX: handle UW iv_start / iv_end directly."""
     if not isinstance(raw_flow, dict):
         return 0.0
 
-    # Most important (your payload)
     ivs = normalize_iv_pct(safe_float(raw_flow.get("iv_start", 0)))
     ive = normalize_iv_pct(safe_float(raw_flow.get("iv_end", 0)))
     if ivs > 0:
@@ -214,7 +196,6 @@ def extract_uw_iv(raw_flow: Dict[str, Any]) -> float:
         if v > 0:
             return float(v)
 
-    # nested greeks sometimes
     g = raw_flow.get("greeks")
     if isinstance(g, dict):
         for k in ("iv", "impliedVolatility", "implied_volatility"):
@@ -301,7 +282,7 @@ class LocalIVStore:
 
         rows = [r for r in rows if isinstance(r, dict) and r.get("date") and r.get("iv") is not None]
         rows.sort(key=lambda r: r["date"])
-        rows = rows[-120:]
+        rows = rows[-180:]
 
         data[key] = rows
         self.save_all(data)
@@ -426,18 +407,15 @@ class EODHDAPI:
 # -------------------- Enricher --------------------
 
 class DataEnricher:
-    def __init__(self, eodhd: EODHDAPI, iv_store: LocalIVStore, iv_lookback_days: int, iv_require_strict: bool, atm_proxy_pct: float):
+    def __init__(self, eodhd: EODHDAPI, iv_store: LocalIVStore, iv_lookback_days: int, iv_require_strict: bool):
         self.eodhd = eodhd
         self.iv_store = iv_store
         self.iv_lookback_days = iv_lookback_days
         self.iv_require_strict = iv_require_strict
-        self.atm_proxy_pct = atm_proxy_pct
 
-    def enrich_trade(self, raw_flow: Dict[str, Any], use_contract_iv: bool, use_underlying_iv: bool) -> Dict[str, Any]:
-        # UW fields mapping (your payload)
+    def enrich_trade(self, raw_flow: Dict[str, Any], use_contract_iv: bool) -> Dict[str, Any]:
         ticker = str(raw_flow.get("ticker", "")).upper().strip()
 
-        # UW uses "type" instead of option_type
         option_type = str(raw_flow.get("option_type") or raw_flow.get("type") or "call").lower().strip()
         if option_type in ("calls", "call"):
             option_type = "call"
@@ -447,19 +425,16 @@ class DataEnricher:
         strike = safe_float(raw_flow.get("strike", 0))
         expiry = str(raw_flow.get("expiry", "")).strip()
 
-        # UW start_time can be epoch ms
         entry_timestamp = to_ct_string(raw_flow.get("start_time") or raw_flow.get("created_at") or "")
 
-        # Spot (use UW underlying_price first if present, else EODHD real-time close)
         spot = safe_float(raw_flow.get("underlying_price", 0))
         spot_source = "UW underlying_price"
         if spot <= 0:
             spot, spot_source = self.eodhd.get_spot_realtime(ticker)
 
-        strike_dist_pct = (abs(strike - spot) / spot * 100.0) if spot > 0 else 0.0
+        strike_dist_pct = (abs(strike - spot) / spot * 100.0) if spot > 0 else 999.0
         dte = calculate_dte(expiry)
 
-        # Premium + Ask%
         total_prem = (
             safe_float(raw_flow.get("total_ask_side_prem", 0))
             + safe_float(raw_flow.get("total_bid_side_prem", 0))
@@ -467,7 +442,6 @@ class DataEnricher:
             + safe_float(raw_flow.get("total_no_side_prem", 0))
         )
         if total_prem <= 0:
-            # sometimes UW provides total_premium directly
             total_prem = safe_float(raw_flow.get("total_premium", 0))
 
         ask_prem = safe_float(raw_flow.get("total_ask_side_prem", 0))
@@ -480,8 +454,8 @@ class DataEnricher:
         denom = (spot * 100.0 * max(volume, 1)) if spot > 0 else 0.0
         premium_pct = (total_prem / denom * 100.0) if denom > 0 else 0.0
 
-        # ---------- FIXED: Contract IV from UW iv_start / iv_end ----------
         ckey = contract_key(ticker, expiry, option_type, strike)
+
         current_iv = 0.0
         contract_iv_reason = "disabled"
         if use_contract_iv:
@@ -491,30 +465,13 @@ class DataEnricher:
                 contract_iv_reason = "UW iv_start/iv_end"
                 self.iv_store.upsert_today(ckey, current_iv)
             else:
-                contract_iv_reason = "UW missing iv_start/iv_end"
+                contract_iv_reason = "UW missing IV fields"
 
         iv_ramping, ramp_points = self.iv_store.detect_ramp(
             ckey, lookback_days=self.iv_lookback_days, require_strict=self.iv_require_strict
         )
 
-        # ---------- Underlying ATM IV logic (per-row proxy; best-per-ticker stored in scan loop) ----------
-        ukey = underlying_iv_key(ticker)
-        iv_underlying_current = 0.0
-        iv_underlying_source = "disabled"
-
-        if use_underlying_iv:
-            # proxy only if the trade is near ATM
-            if current_iv > 0 and strike_dist_pct <= float(self.atm_proxy_pct):
-                iv_underlying_current = current_iv
-                iv_underlying_source = f"Proxy from contract IV (<= {self.atm_proxy_pct:.1f}% from ATM)"
-            else:
-                iv_underlying_source = "No underlying ATM IV available"
-
-        iv_underlying_points_7d = self.iv_store.last_n_points(ukey, 7)
-        iv7d_change = 0.0
-        if len(iv_underlying_points_7d) >= 2:
-            iv7d_change = float(iv_underlying_points_7d[-1][1] - iv_underlying_points_7d[0][1])
-
+        # underlying iv fields will be filled later in the scan pass
         return {
             "ticker": ticker,
             "option_type": option_type,
@@ -540,15 +497,12 @@ class DataEnricher:
             "iv_ramping": bool(iv_ramping),
             "iv_ramp_points": ramp_points,
 
-            "underlying_iv_key": ukey,
-            "iv_underlying_current": float(iv_underlying_current),
-            "iv_underlying_source": iv_underlying_source,
-            "iv_underlying_points_7d": iv_underlying_points_7d,
-            "iv_underlying_7d_change": float(iv7d_change),
+            "iv_underlying_current": 0.0,
+            "iv_underlying_source": "Not computed yet",
+            "iv_underlying_points_7d": [],
+            "iv_underlying_7d_change": 0.0,
 
             "has_sweep": bool(raw_flow.get("has_sweep", raw_flow.get("is_sweep", False))),
-            "ladder_role": "isolated",
-            "related_strikes": [],
             "category_tags": [],
             "_raw": raw_flow,
         }
@@ -556,7 +510,7 @@ class DataEnricher:
 
 # -------------------- Scoring --------------------
 
-class V37ScoringEngine:
+class V38ScoringEngine:
     def score(self, r: Dict[str, Any]) -> Dict[str, Any]:
         score = 0
         factors: List[str] = []
@@ -571,7 +525,7 @@ class V37ScoringEngine:
         elif prem_pct < 1.0 and safe_float(r.get("spot", 0)) > 0:
             score -= 2; penalties.append(f"Ultra-low premium {prem_pct:.2f}% (-2)")
 
-        dist = safe_float(r.get("strike_dist_pct", 0))
+        dist = safe_float(r.get("strike_dist_pct", 999))
         if safe_float(r.get("spot", 0)) > 0:
             if dist <= 7:
                 score += 2; factors.append(f"Strike {dist:.1f}% OTM (+2)")
@@ -677,9 +631,9 @@ class QueueManager:
 
 # -------------------- Streamlit UI --------------------
 
-st.set_page_config(page_title="v3.7 Options Flow Scanner (IV Fixed)", layout="wide")
-st.title("v3.7 Options Flow Scanner (IV Fixed from UW iv_start/iv_end)")
-st.caption("This version reads UW iv_start/iv_end so IV shows (your USO example will now show ~59.7%).")
+st.set_page_config(page_title="v3.8 Options Flow Scanner (IV Fixed)", layout="wide")
+st.title("v3.8 Options Flow Scanner (Contract IV + Underlying IV always shows)")
+st.caption("Contract IV from UW iv_start/iv_end. Underlying IV is best ATM-ish per ticker (or last stored).")
 
 snapshot = SnapshotManager(SNAPSHOT_FILE)
 iv_store = LocalIVStore(IV_STORE_FILE)
@@ -698,22 +652,14 @@ with st.sidebar:
     eodhd_key = st.text_input("EODHD API Key", value=os.getenv("EODHD_API_KEY", ""), type="password")
 
     st.divider()
-    st.subheader("IV Settings")
-    iv_lookback_days = st.slider("Ramp lookback days", 3, 10, 3, 1)
-    iv_strict = st.checkbox("Require strictly increasing IV", value=True)
-    atm_proxy_pct = st.slider("Underlying ATM proxy threshold (%)", 0.5, 10.0, 2.0, 0.5)
-
-    st.divider()
     st.subheader("Scan Controls")
     manual_ticker = st.text_input("Manual ticker scan (optional)", value="").strip().upper()
-    st.caption("If set in Live mode, pulls UW ticker flow for that ticker. If blank, uses flow alerts list.")
+    st.caption("Live mode: if set, uses UW ticker flow for that ticker. Replay: filters snapshot.")
 
-    use_iv_contract = st.checkbox("Use Contract IV (UW iv_start/iv_end) + store", value=True)
-    use_iv_underlying = st.checkbox("Use Underlying IV proxy + store 7D (best per ticker)", value=True)
+    use_contract_iv = st.checkbox("Use Contract IV (UW iv_start/iv_end) + store", value=True)
 
     limit = st.slider("UW flow alerts limit (Live only)", 10, 250, 200, 10)
 
-    # your requested defaults
     min_premium = st.number_input("Min premium ($)", min_value=0, value=1_000_000, step=25_000)
     min_size = st.number_input("Min size (contracts)", min_value=0, value=0, step=100)
     min_vol_oi = st.number_input("Min Vol/OI", min_value=0.0, value=1.0, step=0.1)
@@ -722,7 +668,12 @@ with st.sidebar:
     exclude_indices = st.checkbox("Exclude indices + major ETFs", value=True)
 
     st.divider()
-    st.subheader("Local IV Store")
+    st.subheader("Underlying IV Settings")
+    st.caption("Underlying IV is computed as BEST (closest-to-ATM) contract IV per ticker in this scan.")
+    max_atm_dist_pct = st.slider("Max distance to consider ATM-ish (%)", 0.5, 15.0, 7.0, 0.5)
+
+    st.divider()
+    st.subheader("IV Store")
     st.download_button(
         "Download iv_history_store.json",
         data=iv_store.raw_text(),
@@ -741,11 +692,10 @@ eodhd = EODHDAPI(eodhd_key)
 enricher = DataEnricher(
     eodhd=eodhd,
     iv_store=iv_store,
-    iv_lookback_days=int(iv_lookback_days),
-    iv_require_strict=bool(iv_strict),
-    atm_proxy_pct=float(atm_proxy_pct),
+    iv_lookback_days=3,
+    iv_require_strict=True,
 )
-scorer = V37ScoringEngine()
+scorer = V38ScoringEngine()
 queue = QueueManager(PENDING_TRADES_FILE, INVERSE_SIGNALS_FILE, VALIDATED_TRADES_FILE)
 
 tabs = st.tabs(["Scan", "Connections"])
@@ -794,8 +744,8 @@ with tabs[0]:
                 excluded = EXCLUDED_TICKERS_DEFAULT if exclude_indices else set()
                 results: List[Dict[str, Any]] = []
 
-                # NEW: collect best ATM-ish IV per ticker to store UNDERLYING IV daily
-                best_underlying_iv: Dict[str, Dict[str, Any]] = {}  # ticker -> {"iv":..., "dist":...}
+                # collect best ATM-ish contract IV per ticker
+                best_underlying_iv: Dict[str, Dict[str, Any]] = {}
 
                 with st.spinner("Filtering, enriching, scoring..."):
                     for f in flows:
@@ -804,7 +754,6 @@ with tabs[0]:
                             skip_reasons["bad_ticker"] += 1
                             continue
 
-                        # total premium calc
                         total_prem = (
                             safe_float(f.get("total_ask_side_prem", 0))
                             + safe_float(f.get("total_bid_side_prem", 0))
@@ -838,20 +787,15 @@ with tabs[0]:
                             skip_reasons["min_vol_oi"] += 1
                             continue
 
-                        enriched = enricher.enrich_trade(
-                            f,
-                            use_contract_iv=bool(use_iv_contract),
-                            use_underlying_iv=bool(use_iv_underlying),
-                        )
+                        enriched = enricher.enrich_trade(f, use_contract_iv=bool(use_contract_iv))
 
-                        # pick best near-ATM contract IV as underlying IV for the ticker
-                        if use_iv_underlying:
-                            ivc = safe_float(enriched.get("current_iv", 0))
-                            dist = safe_float(enriched.get("strike_dist_pct", 999))
-                            if ivc > 0:
-                                cur = best_underlying_iv.get(ticker)
-                                if (cur is None) or (dist < safe_float(cur.get("dist", 999))):
-                                    best_underlying_iv[ticker] = {"iv": ivc, "dist": dist}
+                        # choose best ATM-ish IV
+                        ivc = safe_float(enriched.get("current_iv", 0))
+                        dist = safe_float(enriched.get("strike_dist_pct", 999))
+                        if ivc > 0 and dist <= float(max_atm_dist_pct):
+                            cur = best_underlying_iv.get(ticker)
+                            if (cur is None) or (dist < safe_float(cur.get("dist", 999))):
+                                best_underlying_iv[ticker] = {"iv": ivc, "dist": dist}
 
                         scored = scorer.score(enriched)
                         results.append(scored)
@@ -861,10 +805,37 @@ with tabs[0]:
                         if safe_int(scored.get("predictive_score", 0)) <= -3:
                             queue.add_inverse(scored)
 
-                # store best underlying IV per ticker for today (7D history)
-                if use_iv_underlying and best_underlying_iv:
-                    for tkr, info in best_underlying_iv.items():
-                        iv_store.upsert_today(underlying_iv_key(tkr), float(info["iv"]))
+                # store best underlying IV per ticker for today
+                for tkr, info in best_underlying_iv.items():
+                    iv_store.upsert_today(underlying_iv_key(tkr), float(info["iv"]))
+
+                # ✅ NEW: assign underlying IV to ALL rows (best from scan, else last stored)
+                for r in results:
+                    tkr = str(r.get("ticker", "")).upper().strip()
+                    ukey = underlying_iv_key(tkr)
+
+                    best = best_underlying_iv.get(tkr)
+                    if best and safe_float(best.get("iv", 0)) > 0:
+                        r["iv_underlying_current"] = float(best["iv"])
+                        r["iv_underlying_source"] = f"Best ATM-ish IV in scan (dist {best.get('dist', 0):.1f}%)"
+                    else:
+                        pts = iv_store.last_n_points(ukey, 7)
+                        if pts:
+                            r["iv_underlying_current"] = float(pts[-1][1])
+                            r["iv_underlying_source"] = "Local store (most recent)"
+                        else:
+                            r["iv_underlying_current"] = 0.0
+                            r["iv_underlying_source"] = "No underlying IV yet (run daily to build)"
+
+                    r["iv_underlying_points_7d"] = iv_store.last_n_points(ukey, 7)
+                    pts = r["iv_underlying_points_7d"]
+                    if len(pts) >= 2:
+                        r["iv_underlying_7d_change"] = float(pts[-1][1] - pts[0][1])
+                    else:
+                        r["iv_underlying_7d_change"] = 0.0
+
+                # re-score after underlying IV assignment (so score reflects it)
+                results = [scorer.score(r) for r in results]
 
                 st.success(f"Source: {src} • Scored {len(results)} trades")
                 st.write("Skip breakdown:", skip_reasons)
@@ -884,14 +855,14 @@ with tabs[0]:
                                 "Strike": r.get("strike"),
                                 "Expiry": r.get("expiry"),
                                 "Spot": round(safe_float(r.get("spot", 0.0)), 2),
-                                "SpotSrc": str(r.get("spot_source", ""))[:26],
+                                "SpotSrc": str(r.get("spot_source", ""))[:28],
                                 "Premium$": round(safe_float(r.get("total_premium", 0.0))),
                                 "Ask%": round(safe_float(r.get("ask_pct", 0.0)), 1),
                                 "Vol/OI": round(safe_float(r.get("vol_oi_ratio", 0.0)), 2),
                                 "IV(Contract)%": round(safe_float(r.get("current_iv", 0.0)), 2),
-                                "IVcSrc": str(r.get("contract_iv_reason", ""))[:30],
+                                "IVcSrc": str(r.get("contract_iv_reason", ""))[:28],
                                 "IV(Underlying)%": round(safe_float(r.get("iv_underlying_current", 0.0)), 2),
-                                "IVuSrc": str(r.get("iv_underlying_source", ""))[:30],
+                                "IVuSrc": str(r.get("iv_underlying_source", ""))[:28],
                                 "IV7dΔ": round(safe_float(r.get("iv_underlying_7d_change", 0.0)), 2),
                                 "Score": r.get("predictive_score"),
                                 "Max": r.get("max_score"),
@@ -902,8 +873,8 @@ with tabs[0]:
                     st.dataframe(table, use_container_width=True, hide_index=True)
 
                     st.divider()
-                    st.subheader("Details (Top 30)")
-                    for r in results[:30]:
+                    st.subheader("Details (Top 20)")
+                    for r in results[:20]:
                         header = (
                             f"{r['ticker']} {str(r['option_type']).upper()} ${r['strike']} {r['expiry']} • "
                             f"IVc {safe_float(r.get('current_iv',0)):.2f}% • "
@@ -911,6 +882,7 @@ with tabs[0]:
                             f"Score {r['predictive_score']}"
                         )
                         with st.expander(header, expanded=False):
+                            st.write("**Entry (CT):**", r.get("entry_timestamp"))
                             st.write("**Spot Source:**", r.get("spot_source"))
                             st.write("**Contract IV reason:**", r.get("contract_iv_reason"))
                             st.write("**Underlying IV source:**", r.get("iv_underlying_source"))
