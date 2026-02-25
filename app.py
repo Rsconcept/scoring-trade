@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """
-Streamlit v3.8 Options Flow Scanner — FIXED IV + Underlying IV Always Shows
-==========================================================================
-Fixes / Upgrades:
-✅ Contract IV: reads UW iv_start / iv_end (0.xx -> percent)
-✅ UW field mapping: "type" -> option_type, "start_time" epoch ms -> CT
-✅ Spot: prefers UW underlying_price, falls back to EODHD real-time close
-✅ Underlying ATM IV:
-   - For each ticker in the scan, finds the BEST ATM-ish contract IV (closest-to-ATM)
-   - Stores it daily as ticker-level underlying IV in iv_history_store.json
-   - Then assigns that underlying IV to ALL rows of that ticker (so the table always shows it)
-   - If no ATM-ish trade exists today, falls back to last stored underlying IV
-✅ 7D change uses local store points (no external history endpoints)
+Streamlit v3.9 Options Flow Scanner — Contract IV + Underlying IV FIXED (always builds)
+=====================================================================================
+What’s fixed vs v3.8:
+✅ Underlying IV now builds even when your scan filters out ATM-ish trades (ex: min premium = $1M).
+   - If scan doesn't find ATM-ish contract IV for a ticker, we auto-fetch UW ticker flow for that ticker
+     and pick the closest-to-ATM contract IV (using UW underlying_price + strike) and use its IV as
+     Underlying ATM IV proxy.
+✅ Then Underlying IV is assigned to ALL rows for that ticker, and stored daily to iv_history_store.json.
 
-Your requested defaults:
-✅ Min premium default = 1,000,000
-✅ Require Vol > OI default = ON
-✅ Manual ticker scan input (optional)
+Notes:
+- Contract IV comes from UW iv_start/iv_end (fraction -> percent).
+- Underlying ATM IV is a PROXY built from the best (closest-to-ATM) contract IV we can find.
+- Market closed:
+  - UW still returns iv_start/iv_end for alerts/flows (often yes), so Contract IV can show.
+  - Underlying IV can show if we can find a near-ATM flow in UW ticker flow OR if it exists in local store.
 
 requirements.txt:
 streamlit
@@ -179,7 +177,7 @@ def underlying_iv_key(ticker: str) -> str:
 
 
 def extract_uw_iv(raw_flow: Dict[str, Any]) -> float:
-    """FIX: handle UW iv_start / iv_end directly."""
+    """Handles UW iv_start / iv_end (fraction -> percent)."""
     if not isinstance(raw_flow, dict):
         return 0.0
 
@@ -190,7 +188,6 @@ def extract_uw_iv(raw_flow: Dict[str, Any]) -> float:
     if ive > 0:
         return float(ive)
 
-    # other possible keys
     for k in ("iv", "impliedVolatility", "implied_volatility", "implied_vol"):
         v = normalize_iv_pct(safe_float(raw_flow.get(k, 0)))
         if v > 0:
@@ -353,7 +350,7 @@ class UnusualWhalesAPI:
             return True, "OK (UW flow alerts)"
         return False, err or "Failed"
 
-    def get_flows(self, limit: int = 100) -> List[Dict[str, Any]]:
+    def get_flows(self, limit: int = 200) -> List[Dict[str, Any]]:
         status, data, _ = http_get(
             f"{self.BASE_URL}/option-trades/flow-alerts",
             headers=self.headers,
@@ -363,7 +360,7 @@ class UnusualWhalesAPI:
             return []
         return data.get("data", []) or []
 
-    def get_ticker_flow(self, ticker: str, limit: int = 180) -> List[Dict[str, Any]]:
+    def get_ticker_flow(self, ticker: str, limit: int = 250) -> List[Dict[str, Any]]:
         ticker = ticker.strip().upper()
         status, data, _ = http_get(
             f"{self.BASE_URL}/stock/{ticker}/options-flow",
@@ -424,9 +421,9 @@ class DataEnricher:
 
         strike = safe_float(raw_flow.get("strike", 0))
         expiry = str(raw_flow.get("expiry", "")).strip()
-
         entry_timestamp = to_ct_string(raw_flow.get("start_time") or raw_flow.get("created_at") or "")
 
+        # Spot: prefer UW underlying_price, fallback to EODHD real-time
         spot = safe_float(raw_flow.get("underlying_price", 0))
         spot_source = "UW underlying_price"
         if spot <= 0:
@@ -471,7 +468,6 @@ class DataEnricher:
             ckey, lookback_days=self.iv_lookback_days, require_strict=self.iv_require_strict
         )
 
-        # underlying iv fields will be filled later in the scan pass
         return {
             "ticker": ticker,
             "option_type": option_type,
@@ -510,7 +506,7 @@ class DataEnricher:
 
 # -------------------- Scoring --------------------
 
-class V38ScoringEngine:
+class V39ScoringEngine:
     def score(self, r: Dict[str, Any]) -> Dict[str, Any]:
         score = 0
         factors: List[str] = []
@@ -629,11 +625,55 @@ class QueueManager:
         self.save_queue(self.inverse_file, q)
 
 
+# -------------------- Underlying IV Builder (NEW) --------------------
+
+@st.cache_data(ttl=120, show_spinner=False)
+def cached_ticker_flow(token: str, ticker: str, limit: int) -> List[Dict[str, Any]]:
+    uw = UnusualWhalesAPI(token)
+    return uw.get_ticker_flow(ticker, limit=limit)
+
+
+def find_best_atm_iv_from_flows(
+    flows: List[Dict[str, Any]],
+    max_atm_dist_pct: float,
+) -> Optional[Dict[str, Any]]:
+    """
+    Returns {"iv":..., "dist":..., "spot":..., "strike":..., "source":...}
+    Picks the closest-to-ATM contract IV from the provided flow list.
+    """
+    best: Optional[Dict[str, Any]] = None
+    for f in flows:
+        try:
+            spot = safe_float(f.get("underlying_price", 0))
+            strike = safe_float(f.get("strike", 0))
+            if spot <= 0 or strike <= 0:
+                continue
+            dist = abs(strike - spot) / spot * 100.0
+            if dist > max_atm_dist_pct:
+                continue
+
+            iv = extract_uw_iv(f)
+            if iv <= 0:
+                continue
+
+            if best is None or dist < safe_float(best.get("dist", 999)):
+                best = {
+                    "iv": float(iv),
+                    "dist": float(dist),
+                    "spot": float(spot),
+                    "strike": float(strike),
+                    "source": "UW ticker_flow ATM proxy",
+                }
+        except Exception:
+            continue
+    return best
+
+
 # -------------------- Streamlit UI --------------------
 
-st.set_page_config(page_title="v3.8 Options Flow Scanner (IV Fixed)", layout="wide")
-st.title("v3.8 Options Flow Scanner (Contract IV + Underlying IV always shows)")
-st.caption("Contract IV from UW iv_start/iv_end. Underlying IV is best ATM-ish per ticker (or last stored).")
+st.set_page_config(page_title="v3.9 Options Flow Scanner (Underlying IV Fixed)", layout="wide")
+st.title("v3.9 Options Flow Scanner (Contract IV + Underlying IV always builds)")
+st.caption("Underlying IV now builds from UW ticker flow if scan doesn’t include ATM-ish trades.")
 
 snapshot = SnapshotManager(SNAPSHOT_FILE)
 iv_store = LocalIVStore(IV_STORE_FILE)
@@ -660,6 +700,7 @@ with st.sidebar:
 
     limit = st.slider("UW flow alerts limit (Live only)", 10, 250, 200, 10)
 
+    # ✅ defaults requested
     min_premium = st.number_input("Min premium ($)", min_value=0, value=1_000_000, step=25_000)
     min_size = st.number_input("Min size (contracts)", min_value=0, value=0, step=100)
     min_vol_oi = st.number_input("Min Vol/OI", min_value=0.0, value=1.0, step=0.1)
@@ -669,8 +710,9 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Underlying IV Settings")
-    st.caption("Underlying IV is computed as BEST (closest-to-ATM) contract IV per ticker in this scan.")
-    max_atm_dist_pct = st.slider("Max distance to consider ATM-ish (%)", 0.5, 15.0, 7.0, 0.5)
+    max_atm_dist_pct = st.slider("Max distance to consider ATM-ish (%)", 0.5, 20.0, 7.0, 0.5)
+    ticker_flow_fallback = st.checkbox("Fallback: build Underlying IV from UW ticker flow", value=True)
+    ticker_flow_limit = st.slider("Ticker-flow depth (fallback)", 50, 500, 250, 50)
 
     st.divider()
     st.subheader("IV Store")
@@ -685,6 +727,7 @@ with st.sidebar:
         iv_store.reset()
         st.warning("IV store reset.")
 
+
 # Instantiate
 uw = UnusualWhalesAPI(uw_token)
 eodhd = EODHDAPI(eodhd_key)
@@ -695,7 +738,7 @@ enricher = DataEnricher(
     iv_lookback_days=3,
     iv_require_strict=True,
 )
-scorer = V38ScoringEngine()
+scorer = V39ScoringEngine()
 queue = QueueManager(PENDING_TRADES_FILE, INVERSE_SIGNALS_FILE, VALIDATED_TRADES_FILE)
 
 tabs = st.tabs(["Scan", "Connections"])
@@ -710,7 +753,7 @@ def get_source_flows() -> Tuple[List[Dict[str, Any]], str]:
         return flows, "Replay (snapshot)"
 
     if manual_ticker:
-        return uw.get_ticker_flow(manual_ticker, limit=min(400, max(200, limit))), f"Live (UW ticker flow: {manual_ticker})"
+        return uw.get_ticker_flow(manual_ticker, limit=min(600, max(250, limit))), f"Live (UW ticker flow: {manual_ticker})"
     return uw.get_flows(limit=limit), "Live (UW flow alerts)"
 
 
@@ -744,7 +787,7 @@ with tabs[0]:
                 excluded = EXCLUDED_TICKERS_DEFAULT if exclude_indices else set()
                 results: List[Dict[str, Any]] = []
 
-                # collect best ATM-ish contract IV per ticker
+                # best ATM-ish contract IV per ticker found in the *included* scan rows
                 best_underlying_iv: Dict[str, Dict[str, Any]] = {}
 
                 with st.spinner("Filtering, enriching, scoring..."):
@@ -789,13 +832,13 @@ with tabs[0]:
 
                         enriched = enricher.enrich_trade(f, use_contract_iv=bool(use_contract_iv))
 
-                        # choose best ATM-ish IV
+                        # If this row is ATM-ish and has contract IV, it can become underlying IV proxy
                         ivc = safe_float(enriched.get("current_iv", 0))
                         dist = safe_float(enriched.get("strike_dist_pct", 999))
                         if ivc > 0 and dist <= float(max_atm_dist_pct):
                             cur = best_underlying_iv.get(ticker)
                             if (cur is None) or (dist < safe_float(cur.get("dist", 999))):
-                                best_underlying_iv[ticker] = {"iv": ivc, "dist": dist}
+                                best_underlying_iv[ticker] = {"iv": ivc, "dist": dist, "source": "Scan ATM proxy"}
 
                         scored = scorer.score(enriched)
                         results.append(scored)
@@ -805,11 +848,23 @@ with tabs[0]:
                         if safe_int(scored.get("predictive_score", 0)) <= -3:
                             queue.add_inverse(scored)
 
+                # ✅ NEW: For tickers in results with no ATM proxy, fetch ticker_flow and build it anyway
+                tickers_in_results = sorted({str(r.get("ticker", "")).upper().strip() for r in results if r.get("ticker")})
+                if ticker_flow_fallback and uw_token and tickers_in_results:
+                    with st.spinner("Building Underlying IV proxies from UW ticker flow (fallback)..."):
+                        for tkr in tickers_in_results:
+                            if tkr in best_underlying_iv:
+                                continue
+                            tf = cached_ticker_flow(uw_token, tkr, int(ticker_flow_limit))
+                            best = find_best_atm_iv_from_flows(tf, float(max_atm_dist_pct))
+                            if best and safe_float(best.get("iv", 0)) > 0:
+                                best_underlying_iv[tkr] = {"iv": best["iv"], "dist": best["dist"], "source": best["source"]}
+
                 # store best underlying IV per ticker for today
                 for tkr, info in best_underlying_iv.items():
                     iv_store.upsert_today(underlying_iv_key(tkr), float(info["iv"]))
 
-                # ✅ NEW: assign underlying IV to ALL rows (best from scan, else last stored)
+                # assign underlying IV to ALL rows (best from scan/tickerflow, else last stored)
                 for r in results:
                     tkr = str(r.get("ticker", "")).upper().strip()
                     ukey = underlying_iv_key(tkr)
@@ -817,7 +872,7 @@ with tabs[0]:
                     best = best_underlying_iv.get(tkr)
                     if best and safe_float(best.get("iv", 0)) > 0:
                         r["iv_underlying_current"] = float(best["iv"])
-                        r["iv_underlying_source"] = f"Best ATM-ish IV in scan (dist {best.get('dist', 0):.1f}%)"
+                        r["iv_underlying_source"] = f"{best.get('source','ATM proxy')} (dist {best.get('dist',0):.1f}%)"
                     else:
                         pts = iv_store.last_n_points(ukey, 7)
                         if pts:
@@ -829,12 +884,9 @@ with tabs[0]:
 
                     r["iv_underlying_points_7d"] = iv_store.last_n_points(ukey, 7)
                     pts = r["iv_underlying_points_7d"]
-                    if len(pts) >= 2:
-                        r["iv_underlying_7d_change"] = float(pts[-1][1] - pts[0][1])
-                    else:
-                        r["iv_underlying_7d_change"] = 0.0
+                    r["iv_underlying_7d_change"] = float(pts[-1][1] - pts[0][1]) if len(pts) >= 2 else 0.0
 
-                # re-score after underlying IV assignment (so score reflects it)
+                # re-score after underlying IV assignment
                 results = [scorer.score(r) for r in results]
 
                 st.success(f"Source: {src} • Scored {len(results)} trades")
@@ -862,7 +914,7 @@ with tabs[0]:
                                 "IV(Contract)%": round(safe_float(r.get("current_iv", 0.0)), 2),
                                 "IVcSrc": str(r.get("contract_iv_reason", ""))[:28],
                                 "IV(Underlying)%": round(safe_float(r.get("iv_underlying_current", 0.0)), 2),
-                                "IVuSrc": str(r.get("iv_underlying_source", ""))[:28],
+                                "IVuSrc": str(r.get("iv_underlying_source", ""))[:34],
                                 "IV7dΔ": round(safe_float(r.get("iv_underlying_7d_change", 0.0)), 2),
                                 "Score": r.get("predictive_score"),
                                 "Max": r.get("max_score"),
